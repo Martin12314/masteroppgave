@@ -58,7 +58,7 @@ async function install() {
 
   // Already installed? Skip installer completely
   if (navigator.serviceWorker.controller) {
-    location.replace('/login.html');
+    location.replace('/');
     return;
   }
 
@@ -125,7 +125,7 @@ async function install() {
   await postMetric('sw_key_install', { sw_key_install_ms: Math.round(performance.now() - tKey0), kid: jwk?.kid });
 
   await postMetric('sw_bootstrap_total', { sw_bootstrap_total_ms: Math.round(performance.now() - t0) });
-  location.replace('/login.html');
+  location.replace('/');
 }
 
 install().catch(async (e) => {

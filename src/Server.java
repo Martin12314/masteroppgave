@@ -102,7 +102,8 @@ public class Server {
 
         // Static
         contexts.add(http.createContext("/", Server::handleFile));
-
+        contexts.add(http.createContext("/login", Server::handleFile));
+        contexts.add(http.createContext("/index", Server::handleFile));
         // Public APIs
         contexts.add(http.createContext("/sig-pub", Server::handleSigPub));
         contexts.add(http.createContext("/key-exchange", Server::handleKeyExchange));
@@ -287,7 +288,13 @@ public class Server {
     private static void handleFile(HttpExchange ex) {
         try {
             String path = ex.getRequestURI().getPath();
-            if ("/".equals(path)) path = "/login.html";
+
+            if ("/".equals(path) || "/login".equals(path)) {
+                path = "/login.html";
+            } else if ("/index".equals(path)) {
+                path = "/index.html";
+            }
+
             String filePath = path;
 
             if (path.startsWith("/unsigned/")) {
