@@ -214,14 +214,7 @@ public class Server {
     }
 
     private static void applyMetricsCors(HttpExchange ex) {
-        String origin = ex.getRequestHeaders().getFirst("Origin");
-        if (isAllowedMetricsOrigin(origin)) {
-            Headers h = ex.getResponseHeaders();
-            h.set("Access-Control-Allow-Origin", origin);
-            h.set("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-            h.set("Access-Control-Allow-Headers", "Content-Type");
-            h.set("Vary", "Origin");
-        }
+        // CORS handled only by Apache
     }
 
     private static int parseIntOrDefault(String s, int fallback) {
@@ -860,15 +853,6 @@ public class Server {
 
         public void doFilter(HttpExchange ex, Chain chain) throws IOException {
             if ("OPTIONS".equalsIgnoreCase(ex.getRequestMethod())) {
-                String origin = ex.getRequestHeaders().getFirst("Origin");
-                if (origin != null) {
-                    Headers h = ex.getResponseHeaders();
-                    h.set("Access-Control-Allow-Origin", origin);
-                    h.set("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-                    h.set("Access-Control-Allow-Headers", "Content-Type, Content-Digest, Signature-Input, Signature, X-Client-Key-Id, X-Run-Tag");
-                    h.set("Access-Control-Max-Age", "86400");
-                    h.set("Vary", "Origin");
-                }
                 ex.setAttribute("handlerResult",
                         new HandlerResult(204, "text/plain; charset=utf-8", new byte[0]));
                 return;
