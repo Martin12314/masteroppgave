@@ -167,6 +167,7 @@ async function signRequestHeaders(method, targetUri, bodyBytes, headers) {
   const sigInput = buildSigInput(created);
 
   const base =
+    `x-client-key-id: ${CLIENT_REQ_KID}\n` +
     `"@method": "${String(method).toLowerCase()}"\n` +
     `"@target-uri": "${targetUri}"\n` +
     `content-digest: ${cd}\n` +
@@ -180,6 +181,88 @@ async function signRequestHeaders(method, targetUri, bodyBytes, headers) {
 
   headers.set('Signature-Input', `sig1=${sigInput}`);
   headers.set('Signature', `sig1=:${toB64(new Uint8Array(sig))}:`);
+}
+
+async function registerClientKey(jweJwk) {
+  await ensureFixedClientSigningKey();
+
+  const now = Math.floor(Date.now() / 1000);
+  const pubJwk = {
+    kty: CLIENT_REQ_PRIVATE_JWK.kty,
+    kid: CLIENT_REQ_PRIVATE_JWK.kid,
+    use: CLIENT_REQ_PRIVATE_JWK.use,
+    alg: CLIENT_REQ_PRIVATE_JWK.alg,
+    key_ops: ['verify'],
+    ext: CLIENT_REQ_PRIVATE_JWK.ext,
+    n: CLIENT_REQ_PRIVATE_JWK.n,
+    e: CLIENT_REQ_PRIVATE_JWK.e
+  };
+
+  const payload = {
+    client_key_id: CLIENT_REQ_KID,
+    created: now,
+    expires: now + 86400,
+    sw_build: SW_BUILD,
+    pub_jwk: pubJwk
+  };
+
+  // Field order must match Server.java stableRegistrationJson() exactly
+  const stableJson = JSON.stringify({
+    client_key_id: payload.client_key_id,
+    created: payload.created,
+    expires: payload.expires,
+    sw_build: payload.sw_build,
+    pub_jwk: {
+      kty: pubJwk.kty,
+      kid: pubJwk.kid,
+      use: pubJwk.use,
+      alg: pubJwk.alg,
+      key_ops: pubJwk.key_ops,
+      ext: pubJwk.ext,
+      n: pubJwk.n,
+      e: pubJwk.e
+    }
+  });
+
+  const proofSig = await crypto.subtle.sign(
+    { name: 'RSA-PSS', saltLength: 32 },
+    CLIENT_SIGN_KEY,
+    new TextEncoder().encode(stableJson)
+  );
+  const proofSigB64 = toB64(new Uint8Array(proofSig));
+
+  const jweKey = await crypto.subtle.importKey(
+    'jwk',
+    { kty: 'RSA', n: jweJwk.n, e: jweJwk.e, alg: 'RSA-OAEP-256', ext: true, key_ops: ['encrypt'] },
+    { name: 'RSA-OAEP', hash: 'SHA-256' },
+    false,
+    ['encrypt']
+  );
+
+  const envelope = JSON.stringify({ payload, proof_sig_b64: proofSigB64 });
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'RSA-OAEP' },
+    jweKey,
+    new TextEncoder().encode(envelope)
+  );
+  const ciphertextB64 = toB64(new Uint8Array(ciphertext));
+
+  const res = await fetch(APP_ORIGIN + '/req-key/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      enc: 'rsa-oaep-256-json',
+      kid: jweJwk.kid,
+      ciphertext_b64: ciphertextB64
+    })
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error('registration failed: HTTP ' + res.status + ' ' + txt);
+  }
+
+  log('client key registered kid=' + CLIENT_REQ_KID + ' expires=' + payload.expires);
 }
 
 self.addEventListener('install', () => {
@@ -219,6 +302,13 @@ self.addEventListener('message', async e => {
       sw_build: SW_BUILD,
       script_url: self.registration?.active?.scriptURL || self.location.href
     });
+    return;
+  }
+
+  if (e.data?.type === 'REGISTER_CLIENT_KEY') {
+    registerClientKey(e.data.jweJwk)
+      .then(() => e.source?.postMessage?.({ type: 'REGISTER_OK', client_key_id: CLIENT_REQ_KID }))
+      .catch(err => e.source?.postMessage?.({ type: 'REGISTER_FAIL', message: err?.message || String(err) }));
     return;
   }
 
@@ -328,6 +418,7 @@ self.addEventListener('fetch', event => {
     const u = new URL(upstreamUrl);
     const targetUri = u.pathname + u.search;
 
+    headers.set('X-Client-Key-Id', CLIENT_REQ_KID);
     await signRequestHeaders(event.request.method, targetUri, bodyBytes, headers);
     init.headers = headers;
 

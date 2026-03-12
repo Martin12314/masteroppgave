@@ -124,6 +124,39 @@ async function install() {
   await ack;
   await postMetric('sw_key_install', { sw_key_install_ms: Math.round(performance.now() - tKey0), kid: jwk?.kid });
 
+  // 5) Fetch JWE public key and register the SW's client signing key with the server
+  const kxResp = await fetch('https://app.masteroppgave2026.no/key-exchange', {
+    cache: 'no-store',
+    mode: 'cors',
+    credentials: 'omit'
+  });
+  if (!kxResp.ok) throw new Error('key-exchange HTTP ' + kxResp.status);
+  const jweJwk = await kxResp.json();
+
+  const regAck = new Promise((resolve, reject) => {
+    const to = setTimeout(() => reject(new Error('REGISTER_CLIENT_KEY timeout')), 10000);
+    navigator.serviceWorker.addEventListener('message', function onMsg(e) {
+      if (e.data?.type === 'REGISTER_OK') {
+        clearTimeout(to);
+        navigator.serviceWorker.removeEventListener('message', onMsg);
+        resolve(e.data);
+      }
+      if (e.data?.type === 'REGISTER_FAIL') {
+        clearTimeout(to);
+        navigator.serviceWorker.removeEventListener('message', onMsg);
+        reject(new Error(e.data.message || 'REGISTER_FAIL'));
+      }
+    });
+  });
+
+  const tReg0 = performance.now();
+  target.postMessage({ type: 'REGISTER_CLIENT_KEY', jweJwk });
+  await regAck;
+  await postMetric('sw_client_key_registered', {
+    sw_reg_ms: Math.round(performance.now() - tReg0),
+    client_key_id: 'client-req-1'
+  });
+
   await postMetric('sw_bootstrap_total', { sw_bootstrap_total_ms: Math.round(performance.now() - t0) });
   location.replace('/');
 }
