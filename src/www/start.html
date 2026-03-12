@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Choose Key-Exchange Mode</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <link rel="stylesheet" href="/styles.css">
+    <style>
+        .card { border:1px solid #ddd; border-radius:.5rem; padding:1rem; margin:1rem 0; text-align:left; cursor:pointer }
+        .grid { display:grid; gap:.75rem; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); }
+        .muted { color:#555; }
+    </style>
+</head>
+<body>
+<h1>Key-Exchange Mode</h1>
+<p class="muted">Pick how the browser should fetch the JWE public key and integrity headers.</p>
+
+<div class="grid">
+    <button class="card" data-mode="normal"><strong>No tamper</strong><br>Digest + Signature valid</button>
+    <button class="card" data-mode="tamper-signature"><strong>Tamper: signature</strong><br>Digest PASS, Signature FAIL</button>
+    <button class="card" data-mode="tamper-digest"><strong>Tamper: digest</strong><br>Digest FAIL, Signature PASS</button>
+    <button class="card" data-mode="tamper-body"><strong>Tamper: body</strong><br>Digest FAIL, Signature FAIL</button>
+    <button class="card" data-mode="tamper-all"><strong>Tamper: all</strong><br>Digest FAIL, Signature FAIL</button>
+</div>
+
+<p class="muted">Your choice is used for the next page load and can be changed anytime.</p>
+
+<script>
+    document.querySelectorAll('[data-mode]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const mode = btn.getAttribute('data-mode'); // normal | tamper-*
+        sessionStorage.setItem('kxMode', mode);
+        window.location.href = '/index.html';
+      });
+    });
+</script>
+</body>
+</html>

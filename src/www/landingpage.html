@@ -1,0 +1,79 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Bootstrap landing</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+        body { font-family: system-ui, sans-serif; padding: 1rem; }
+        pre { background:#0b1020; color:#d0d7ff; padding:1rem; border-radius:.5rem; max-height: 60vh; overflow:auto; }
+    </style>
+</head>
+<body>
+<h1>Bootstrap landing</h1>
+<pre id="log">Starting…</pre>
+
+<script>
+    const out = document.getElementById('log');
+    const log = (m) => {
+      console.log('[LANDING]', m);
+      out.textContent += '\n' + m;
+      out.scrollTop = out.scrollHeight;
+    };
+
+    (async () => {
+      log('landing started');
+
+      // Read verified SIG-PUB from fragment (never sent to server)
+      const fragment = location.hash.slice(1);
+      if (!fragment) {
+        log('ERROR: Missing bootstrap data (no URL fragment)');
+        document.body.insertAdjacentHTML('beforeend','<p><b>Missing bootstrap data</b></p>');
+        return;
+      }
+
+      let jwk;
+      try {
+        jwk = JSON.parse(atob(fragment));
+        log('verified SIG-PUB loaded from fragment (kid=' + (jwk.kid || '?') + ')');
+      } catch (e) {
+        log('ERROR: Failed to decode fragment: ' + e);
+        return;
+      }
+
+      if (!('serviceWorker' in navigator)) {
+        log('ERROR: ServiceWorker not supported in this browser');
+        return;
+      }
+
+      // Register SW
+      log('registering service worker: /sw.js (scope=/)');
+      const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+
+      // Wait until active
+      await navigator.serviceWorker.ready;
+      log('service worker ready');
+
+      // Ensure there is an active worker (sometimes it is "waiting" on first install)
+      const active = reg.active || reg.waiting || reg.installing;
+      if (!active) {
+        log('ERROR: No service worker instance available');
+        return;
+      }
+
+      // Provide verified key to SW
+      log('sending SET_SIG_KEY to SW');
+      active.postMessage({ type: 'SET_SIG_KEY', jwk });
+
+      // Small delay so SW logs can appear before navigation
+      await new Promise(r => setTimeout(r, 150));
+
+      log('redirecting to /login.html');
+      location.replace('/login.html');
+    })().catch(err => {
+      log('FATAL: ' + (err?.message || err));
+      console.error(err);
+    });
+</script>
+</body>
+</html>
