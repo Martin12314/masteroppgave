@@ -29,7 +29,9 @@ async function cachePutJson(key, value) {
   const c = await caches.open(CONFIG_CACHE);
   await c.put(
     key,
-    new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } })
+    new Response(JSON.stringify(value), {
+      headers: { 'Content-Type': 'application/json' }
+    })
   );
 }
 
@@ -65,8 +67,13 @@ function log(...args) {
     .catch(() => {});
 }
 
-async function respond(event, message) {
-  // Why: event.source can be null in some edge cases; clientId is safer; broadcast is last-resort.
+async function reply(event, message) {
+  const port = event.ports && event.ports[0];
+  if (port) {
+    port.postMessage(message);
+    return;
+  }
+
   try {
     if (event.source?.postMessage) {
       event.source.postMessage(message);
@@ -212,6 +219,28 @@ async function ensureClientSigningKey() {
   await generateClientSigningKeyMaterial();
 }
 
+async function ensureSigVerifyKeyLoaded() {
+  if (SIG_VERIFY_KEY) return true;
+  const jwk = await loadSigJwk();
+  if (!jwk) return false;
+
+  try {
+    SIG_VERIFY_KEY = await crypto.subtle.importKey(
+      'jwk',
+      jwk,
+      { name: 'RSA-PSS', hash: 'SHA-256' },
+      false,
+      ['verify']
+    );
+    log('lazy restored SIG_VERIFY_KEY kid=' + (jwk.kid || '?'));
+    return true;
+  } catch (e) {
+    SIG_VERIFY_KEY = null;
+    log('lazy restore SIG_VERIFY_KEY failed: ' + (e?.message || String(e)));
+    return false;
+  }
+}
+
 async function signRequestHeaders(method, targetUri, bodyBytes, headers) {
   await ensureClientSigningKey();
 
@@ -255,12 +284,18 @@ async function encryptEnvelopeAsJwe(envelope, jweJwk) {
   );
 
   return await new CompactEncrypt(new TextEncoder().encode(JSON.stringify(envelope)))
-    .setProtectedHeader({
-      alg: 'RSA-OAEP-256',
-      enc: 'A256GCM',
-      kid: jweJwk.kid
-    })
+    .setProtectedHeader({ alg: 'RSA-OAEP-256', enc: 'A256GCM', kid: jweJwk.kid })
     .encrypt(publicKey);
+}
+
+async function fetchWithTimeout(url, init, timeoutMs) {
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(to);
+  }
 }
 
 async function registerClientKey(jweJwk) {
@@ -299,21 +334,31 @@ async function registerClientKey(jweJwk) {
     new TextEncoder().encode(stableJson)
   );
 
-  const envelope = {
-    payload,
-    proof_sig_b64: toB64(new Uint8Array(proofSig))
-  };
-
+  const envelope = { payload, proof_sig_b64: toB64(new Uint8Array(proofSig)) };
   const ciphertext = await encryptEnvelopeAsJwe(envelope, jweJwk);
 
-  const res = await fetch(APP_ORIGIN + '/req-key/register', {
-    method: 'POST',
-    mode: 'cors',
-    credentials: 'omit',
-    cache: 'no-store',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ enc: 'jwe', kid: jweJwk.kid, ciphertext })
-  });
+  const url = APP_ORIGIN + '/req-key/register';
+  log('registerClientKey POST ' + url + ' kid=' + jweJwk?.kid);
+
+  let res;
+  try {
+    res = await fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        mode: 'cors',
+        credentials: 'omit',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enc: 'jwe', kid: jweJwk.kid, ciphertext })
+      },
+      15000
+    );
+  } catch (e) {
+    throw new Error('register fetch failed: ' + (e?.name === 'AbortError' ? 'timeout' : (e?.message || String(e))));
+  }
+
+  log('registerClientKey HTTP ' + res.status);
 
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
@@ -380,23 +425,7 @@ self.addEventListener('activate', (event) => {
     (async () => {
       await self.clients.claim();
       await ensureClientSigningKey();
-
-      const jwk = await loadSigJwk();
-      if (jwk) {
-        try {
-          SIG_VERIFY_KEY = await crypto.subtle.importKey(
-            'jwk',
-            jwk,
-            { name: 'RSA-PSS', hash: 'SHA-256' },
-            false,
-            ['verify']
-          );
-          log('restored SIG_VERIFY_KEY kid=' + (jwk.kid || '?'));
-        } catch (err) {
-          SIG_VERIFY_KEY = null;
-          log('failed restore key: ' + (err?.message || String(err)));
-        }
-      }
+      await ensureSigVerifyKeyLoaded();
     })()
   );
 });
@@ -406,7 +435,8 @@ self.addEventListener('message', (event) => {
 
   if (data.type === 'PING_SW') {
     event.waitUntil(
-      respond(event, {
+      reply(event, {
+        ok: true,
         type: 'PONG_SW',
         sw_build: SW_BUILD,
         script_url: self.registration?.active?.scriptURL || self.location.href,
@@ -432,14 +462,16 @@ self.addEventListener('message', (event) => {
 
           await saveSigJwk(jwk);
 
-          await respond(event, {
+          await reply(event, {
+            ok: true,
             type: 'SIG_KEY_INSTALLED',
             kid: jwk?.kid || '?',
             sw_build: SW_BUILD
           });
         } catch (err) {
           SIG_VERIFY_KEY = null;
-          await respond(event, {
+          await reply(event, {
+            ok: false,
             type: 'SIG_KEY_ERROR',
             message: err?.message || String(err),
             sw_build: SW_BUILD
@@ -454,14 +486,23 @@ self.addEventListener('message', (event) => {
     event.waitUntil(
       (async () => {
         try {
+          log('REGISTER_CLIENT_KEY received');
           await registerClientKey(data.jweJwk);
-          await respond(event, { type: 'REGISTER_OK', client_key_id: CLIENT_REQ_KID });
+          await reply(event, {
+            ok: true,
+            type: 'REGISTER_OK',
+            client_key_id: CLIENT_REQ_KID
+          });
         } catch (err) {
-          await respond(event, { type: 'REGISTER_FAIL', message: err?.message || String(err) });
+          log('REGISTER_CLIENT_KEY failed: ' + (err?.message || String(err)));
+          await reply(event, {
+            ok: false,
+            type: 'REGISTER_FAIL',
+            message: err?.message || String(err)
+          });
         }
       })()
     );
-    return;
   }
 });
 
@@ -491,8 +532,15 @@ self.addEventListener('fetch', (event) => {
         const isUnsigned = url.pathname.startsWith('/unsigned/');
         const runTag = getRunTagFromRequest(req);
 
-        if (!SIG_VERIFY_KEY || !CLIENT_SIGN_KEY || !CLIENT_REQ_KID) {
-          return Response.redirect('/baseline.html', 302);
+        // Lazy rehydrate in case SW restarted between requests.
+        await ensureClientSigningKey();
+        const okSig = await ensureSigVerifyKeyLoaded();
+
+        if (!okSig || !CLIENT_SIGN_KEY || !CLIENT_REQ_KID) {
+          return new Response('SW not bootstrapped yet (missing keys).', {
+            status: 503,
+            headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+          });
         }
 
         let upstreamUrl = buildUpstreamUrl(url);
@@ -502,16 +550,14 @@ self.addEventListener('fetch', (event) => {
           upstreamUrl = u0.toString();
         }
 
-        let bodyBytes;
-        if (req.method === 'GET' || req.method === 'HEAD') {
-          bodyBytes = new Uint8Array(0);
-        } else {
-          bodyBytes = new Uint8Array(await req.clone().arrayBuffer());
-        }
+        const isBodyless = req.method === 'GET' || req.method === 'HEAD';
+        const bodyBuf = isBodyless ? null : await req.clone().arrayBuffer();
+        const bodyBytes = bodyBuf ? new Uint8Array(bodyBuf) : new Uint8Array(0);
 
         const headers = new Headers();
+
         const contentType = req.headers.get('Content-Type');
-        if (contentType && req.method !== 'GET' && req.method !== 'HEAD') headers.set('Content-Type', contentType);
+        if (contentType && !isBodyless) headers.set('Content-Type', contentType);
 
         const accept = req.headers.get('Accept');
         if (accept) headers.set('Accept', accept);
@@ -530,7 +576,7 @@ self.addEventListener('fetch', (event) => {
         const signedReq = new Request(upstreamUrl, {
           method: req.method,
           headers,
-          body: req.method === 'GET' || req.method === 'HEAD' ? undefined : bodyBytes,
+          body: bodyBuf ?? undefined,
           redirect: 'follow',
           cache: 'no-store',
           mode: 'cors',
@@ -544,12 +590,15 @@ self.addEventListener('fetch', (event) => {
         if (res.type === 'opaque') return res;
         if (!isProtectedContentType(ct)) return res;
 
-        const responseBytes = new Uint8Array(await res.clone().arrayBuffer());
+        const responseBuf = await res.clone().arrayBuffer();
+        const responseBytes = new Uint8Array(responseBuf);
 
         await verifyResponseWithTimings(res, responseBytes, req.method, targetUri);
 
         const outHeaders = new Headers(res.headers);
         outHeaders.delete('content-length');
+        outHeaders.delete('content-encoding');
+        outHeaders.delete('transfer-encoding');
 
         return new Response(responseBytes, {
           status: res.status,

@@ -167,6 +167,12 @@ public class Server {
        METRICS HELPERS
        ========================= */
 
+    private static String kidsSummary() {
+        List<String> kids = new ArrayList<>(JWE_PUBLIC_KEYS.keySet());
+        Collections.sort(kids);
+        return "CURRENT_JWE_KID=" + CURRENT_JWE_KID + " knownKids=" + kids;
+    }
+
     private static final Set<String> SEEN_METRIC_IDS =
             Collections.synchronizedSet(new LinkedHashSet<>());
 
@@ -322,6 +328,7 @@ public class Server {
 
     private static void handleSigPub(HttpExchange ex) {
         try {
+            ex.getResponseHeaders().set("Cache-Control", "no-store, no-cache");
             long now = System.currentTimeMillis() / 1000L;
             long exp = now + 86400;
 
@@ -348,6 +355,11 @@ public class Server {
 
     private static void handleKeyExchange(HttpExchange ex) {
         try {
+            ex.getResponseHeaders().set("Cache-Control", "no-store, no-cache");
+            System.out.println("[KEY_EXCHANGE] " + kidsSummary());
+            System.out.println("[KEY_EXCHANGE] remote=" + ex.getRemoteAddress()
+                    + " origin=" + ex.getRequestHeaders().getFirst("Origin")
+                    + " host=" + ex.getRequestHeaders().getFirst("Host"));
             RSAPublicKey pub = JWE_PUBLIC_KEYS.get(CURRENT_JWE_KID);
 
             String n = b64urlUnsigned(pub.getModulus().toByteArray());
@@ -382,7 +394,9 @@ public class Server {
                 return;
             }
 
-            if (!CURRENT_JWE_KID.equals(kid)) {
+            // Accept any known kid (supports rotation / multi-instance)
+            if (kid == null || kid.isBlank() || !JWE_PUBLIC_KEYS.containsKey(kid)) {
+                System.out.println("[REQ_KEY_REGISTER] BAD_KID body.kid=" + kid + " " + kidsSummary());
                 ex.setAttribute("handlerResult",
                         HandlerResult.jsonStatus(400, "{\"ok\":false,\"error\":\"bad_kid\"}"));
                 return;
@@ -939,6 +953,7 @@ public class Server {
                 ex.setAttribute("handlerResult",
                         HandlerResult.jsonStatus(401, "{\"ok\":false,\"error\":\"" + json(ve.getMessage()) + "\"}")
                 );
+                chain.doFilter(ex);  // ← ADD THIS
             }
         }
     }
