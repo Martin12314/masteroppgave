@@ -1,68 +1,93 @@
-// sw.js
-// Purpose:
-// - proxy same-origin app requests to APP_ORIGIN
-// - sign upstream requests
-// - verify signed protected responses
-// - DO NOT proxy metrics anymore
-// - metrics must be sent directly to APP_ORIGIN from the page
+// /sw.js
+import { CompactEncrypt, importJWK } from 'https://cdn.jsdelivr.net/npm/jose@5/+esm';
 
 let SIG_VERIFY_KEY = null;
 let CLIENT_SIGN_KEY = null;
+let CLIENT_PUB_JWK = null;
+let CLIENT_REQ_KID = null;
 
-const SW_BUILD = '2026-03-12-no-metrics-forward-v2';
-
-const CLIENT_REQ_KID = 'client-req-1';
+const SW_BUILD = '2026-03-13-jwe-register-v5-dynamic-client-key';
 const APP_ORIGIN = 'https://app.masteroppgave2026.no';
 
 const BOOTSTRAP_PATHS = new Set([
+  '/',
+  '/baseline.html',
   '/sw.js',
   '/Installer.js',
   '/installer.js',
-  '/favicon.ico'
+  '/favicon.ico',
+  '/styles.css',
+  '/assets/metrics-client.js',
+  '/assets/metrics-debug.html'
 ]);
 
-const CONFIG_CACHE = 'sw-config-v1';
+const CONFIG_CACHE = 'sw-config-v2';
 const SIG_CACHE_KEY = '/__sig_verify_jwk.json';
+const CLIENT_REQ_KEYPAIR_CACHE_KEY = '/__client_req_keypair.json';
 
-const CLIENT_REQ_PRIVATE_JWK = {
-  kty: "RSA",
-  kid: "client-req-1",
-  use: "sig",
-  alg: "PS256",
-  key_ops: ["sign"],
-  ext: true,
-  n: "u31RCl3cGubeBaacyzc00o5jLnBlfNefG1sKCVQdNSSDJdOFJ96oS7oIlL31qEQM1hDCH3MIqZHwHzgTpAXfLZDaJme-GPDT8tJCj8jfbCMVpeGQMbV9N6N7nlQOk8MJEK8TeS8fK3I4M2QiZngbhKDEhNAejiaMvuqWd60RAM1UwsEY_XBNWPFO3Ig9uROrDyfQdu1LCD9tFsBzVBn-O-eFdEVa0wO4LMdQmGgEl6xFfEnNC36TFR7_TZJEuHuBS_rLtUVIy1arPUInN1snPkcBzadklNYpvT1szuMghVJES_-HQKgs_19KdA-4f1nezprTBQYrtMyBfGnCoM8JCQ",
-  e: "AQAB",
-  d: "GwlCpu6K_1wcVw9EG-_Nj7FVrwwpLlv_hxfVNiwpfBDUUp-SW4H5ndXpR92ur4GEolfPTm6tqJoxWKci-euY177EHnamTH1p6uGUFJzgTv0uMXn565kiweOyv02avocI5x1__uEjKwYxAYQmi8U1HqZ6QDasuU3ozN0SLpbH1WgHIWNGOuMZivcYG5qWAnS7-IGYo69JFLiH6j685qZb4GUmZSzzvB7R5AkgMkihxobur1JLBTY_dUVl1at7cbAF8uJ3GvnUtUXUMql8T0NHHJJegLah2UD4d3hliCxV9XO-JkBV-SNAmVAJh1mQMC41Jt_Jbmt__nAKwqU3448rUw",
-  p: "x0NDaJ0sdsuVwAy7_3E6N2Mb220Hroq0nu2-gr9MPkIhzmPFCLPu8BirRhXq9Nm8RXmDyZqBvgBbMZCJN5Vl99IQSK7iS2G2V4ZWkaKKOVmBb9P373_6PHDCTHNjVhhe1z1MEaYZdYqHTFC6PVEKBJvbiIW9rDqL6id3bxZ5F_c",
-  q: "8N_f3juGJxWmWOZzvfYTfbAz9oVa19rOD_pQ_l9S7gvd4jwXPzK4B7oYDYFlZef8nhevuVBB50i5euZgnKJD_XjEYo-a8ySr5QR_LUUv5DaspZJWy4KuSlX6rC-6TF_7yym_0bgM_zLWwD5rgMuQRfswurucdg1sWOa5WD8Kpv8",
-  dp: "Sn6OE-02s07XNE5OdmgpQI2v22--gHVgo030fELySRBGPTe1cNR8Dozac0A8b797EGomZ9d4i8TsUvJbKkmTLnv9FH81IMNt_Pi_IoEmtdwNdPZE6efpcHEjYpt81rITutoytyJmwDfC7zf6-HN0kFaIU1jUmS_mIOsSTpiTOu8",
-  dq: "rqAfFGXi5AL2Dg1Ea7sydjR_94DGUyb1rO-0ODWzUZCY06Ls14xVjoSDW4crk62TnqldY-OjY6F9lnPeJrAcym37MdkaZJt5YxbXfGJkTfa1Q3PMKM4cvReIG7yeOzB6wtcJkWj1Qy4AMm8OUNlDRvjMYxQQYiVpHyplxGwvtNE",
-  qi: "IAFKq9qRqX3D--euRvDbPMN8WT2PWZxBeXCu8AtvCckjqlUapBBKT00FDRGX74I2RbaPpKLXVSMUNYTkTnM8XpIak_FC3GjjYXKvWo--Y8HjUab6klcX_-yJkxQI1Dvjvn5YHAKY8U8nzwP-QCL-6Z567gm1dRPvOlFEY5TDEY0"
-};
+async function cachePutJson(key, value) {
+  const c = await caches.open(CONFIG_CACHE);
+  await c.put(
+    key,
+    new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } })
+  );
+}
+
+async function cacheGetJson(key) {
+  const c = await caches.open(CONFIG_CACHE);
+  const r = await c.match(key);
+  if (!r) return null;
+  try {
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
 
 async function saveSigJwk(jwk) {
-  const c = await caches.open(CONFIG_CACHE);
-  await c.put(SIG_CACHE_KEY, new Response(JSON.stringify(jwk), {
-    headers: { 'Content-Type': 'application/json' }
-  }));
+  await cachePutJson(SIG_CACHE_KEY, jwk);
 }
 
 async function loadSigJwk() {
-  const c = await caches.open(CONFIG_CACHE);
-  const r = await c.match(SIG_CACHE_KEY);
-  if (!r) return null;
-  try { return await r.json(); } catch { return null; }
+  return await cacheGetJson(SIG_CACHE_KEY);
 }
 
 function log(...args) {
   const msg = args.join(' ');
   console.log('[SW]', msg);
-  self.clients.matchAll({ includeUncontrolled: true }).then(clients => {
-    for (const client of clients) {
-      client.postMessage({ type: 'SW_LOG', message: msg, ts: new Date().toISOString() });
+  self.clients
+    .matchAll({ includeUncontrolled: true })
+    .then((clients) => {
+      for (const client of clients) {
+        client.postMessage({ type: 'SW_LOG', message: msg, ts: new Date().toISOString() });
+      }
+    })
+    .catch(() => {});
+}
+
+async function respond(event, message) {
+  // Why: event.source can be null in some edge cases; clientId is safer; broadcast is last-resort.
+  try {
+    if (event.source?.postMessage) {
+      event.source.postMessage(message);
+      return;
     }
-  });
+  } catch {}
+
+  try {
+    if (event.clientId) {
+      const c = await self.clients.get(event.clientId);
+      if (c?.postMessage) {
+        c.postMessage(message);
+        return;
+      }
+    }
+  } catch {}
+
+  try {
+    const all = await self.clients.matchAll({ includeUncontrolled: true });
+    for (const c of all) c.postMessage(message);
+  } catch {}
 }
 
 function getRunTagFromRequest(req) {
@@ -79,7 +104,7 @@ function toB64(bytes) {
 
 function b64ToBytes(b64) {
   const bin = atob(b64);
-  return Uint8Array.from(bin, c => c.charCodeAt(0));
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
 }
 
 function parseDigestHeader(cd) {
@@ -94,13 +119,211 @@ function parseSigHeader(sig) {
 
 function isProtectedContentType(ct) {
   ct = (ct || '').toLowerCase();
-  return ct.includes('text/html') ||
-         ct.includes('application/json') ||
-         ct.includes('application/javascript') ||
-         ct.includes('text/javascript');
+  return (
+    ct.includes('text/html') ||
+    ct.includes('application/json') ||
+    ct.includes('application/javascript') ||
+    ct.includes('text/javascript')
+  );
 }
 
-async function verifyResponseWithTimings(response, bodyText, method, targetUri) {
+function shouldBypass(url) {
+  if (!url.protocol.startsWith('http')) return true;
+  if (url.origin !== self.location.origin) return true;
+  if (BOOTSTRAP_PATHS.has(url.pathname)) return true;
+  return false;
+}
+
+function buildUpstreamUrl(url) {
+  return APP_ORIGIN + url.pathname + url.search;
+}
+
+function buildSigInput(created) {
+  return `("@method" "@target-uri" "content-digest");created=${created};keyid="${CLIENT_REQ_KID}";alg="rsa-pss-sha256"`;
+}
+
+async function generateClientSigningKeyMaterial() {
+  const keyPair = await crypto.subtle.generateKey(
+    {
+      name: 'RSA-PSS',
+      modulusLength: 2048,
+      publicExponent: new Uint8Array([1, 0, 1]),
+      hash: 'SHA-256'
+    },
+    true,
+    ['sign', 'verify']
+  );
+
+  const privateJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
+  const publicJwk = await crypto.subtle.exportKey('jwk', keyPair.publicKey);
+
+  const kid = 'client-req-' + crypto.randomUUID();
+
+  privateJwk.kid = kid;
+  privateJwk.use = 'sig';
+  privateJwk.alg = 'PS256';
+  privateJwk.key_ops = ['sign'];
+  privateJwk.ext = true;
+
+  publicJwk.kid = kid;
+  publicJwk.use = 'sig';
+  publicJwk.alg = 'PS256';
+  publicJwk.key_ops = ['verify'];
+  publicJwk.ext = true;
+
+  await cachePutJson(CLIENT_REQ_KEYPAIR_CACHE_KEY, {
+    client_key_id: kid,
+    created_at_ms: Date.now(),
+    private_jwk: privateJwk,
+    public_jwk: publicJwk
+  });
+
+  CLIENT_REQ_KID = kid;
+  CLIENT_PUB_JWK = publicJwk;
+  CLIENT_SIGN_KEY = await crypto.subtle.importKey(
+    'jwk',
+    privateJwk,
+    { name: 'RSA-PSS', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  log('generated client signing key kid=' + kid);
+}
+
+async function ensureClientSigningKey() {
+  if (CLIENT_SIGN_KEY && CLIENT_REQ_KID && CLIENT_PUB_JWK) return;
+
+  const saved = await cacheGetJson(CLIENT_REQ_KEYPAIR_CACHE_KEY);
+  if (saved?.private_jwk && saved?.public_jwk && saved?.client_key_id) {
+    CLIENT_REQ_KID = saved.client_key_id;
+    CLIENT_PUB_JWK = saved.public_jwk;
+    CLIENT_SIGN_KEY = await crypto.subtle.importKey(
+      'jwk',
+      saved.private_jwk,
+      { name: 'RSA-PSS', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+    log('restored client signing key kid=' + CLIENT_REQ_KID);
+    return;
+  }
+
+  await generateClientSigningKeyMaterial();
+}
+
+async function signRequestHeaders(method, targetUri, bodyBytes, headers) {
+  await ensureClientSigningKey();
+
+  const created = Math.floor(Date.now() / 1000);
+  const hash = await crypto.subtle.digest('SHA-256', bodyBytes);
+  const cd = `sha-256=:${toB64(new Uint8Array(hash))}:`;
+  headers.set('Content-Digest', cd);
+
+  const sigInput = buildSigInput(created);
+
+  const base =
+    `x-client-key-id: ${CLIENT_REQ_KID}\n` +
+    `"@method": "${String(method).toLowerCase()}"\n` +
+    `"@target-uri": "${targetUri}"\n` +
+    `content-digest: ${cd}\n` +
+    `"@signature-params": ${sigInput}`;
+
+  const sig = await crypto.subtle.sign(
+    { name: 'RSA-PSS', saltLength: 32 },
+    CLIENT_SIGN_KEY,
+    new TextEncoder().encode(base)
+  );
+
+  headers.set('X-Client-Key-Id', CLIENT_REQ_KID);
+  headers.set('Signature-Input', `sig1=${sigInput}`);
+  headers.set('Signature', `sig1=:${toB64(new Uint8Array(sig))}:`);
+}
+
+async function encryptEnvelopeAsJwe(envelope, jweJwk) {
+  const publicKey = await importJWK(
+    {
+      kty: 'RSA',
+      kid: jweJwk.kid,
+      n: jweJwk.n,
+      e: jweJwk.e,
+      alg: 'RSA-OAEP-256',
+      use: 'enc',
+      ext: true
+    },
+    'RSA-OAEP-256'
+  );
+
+  return await new CompactEncrypt(new TextEncoder().encode(JSON.stringify(envelope)))
+    .setProtectedHeader({
+      alg: 'RSA-OAEP-256',
+      enc: 'A256GCM',
+      kid: jweJwk.kid
+    })
+    .encrypt(publicKey);
+}
+
+async function registerClientKey(jweJwk) {
+  await ensureClientSigningKey();
+
+  const now = Math.floor(Date.now() / 1000);
+
+  const payload = {
+    client_key_id: CLIENT_REQ_KID,
+    created: now,
+    expires: now + 86400,
+    sw_build: SW_BUILD,
+    pub_jwk: {
+      kty: CLIENT_PUB_JWK.kty,
+      kid: CLIENT_PUB_JWK.kid,
+      use: 'sig',
+      alg: 'PS256',
+      key_ops: ['verify'],
+      ext: true,
+      n: CLIENT_PUB_JWK.n,
+      e: CLIENT_PUB_JWK.e
+    }
+  };
+
+  const stableJson = JSON.stringify({
+    client_key_id: payload.client_key_id,
+    created: payload.created,
+    expires: payload.expires,
+    sw_build: payload.sw_build,
+    pub_jwk: payload.pub_jwk
+  });
+
+  const proofSig = await crypto.subtle.sign(
+    { name: 'RSA-PSS', saltLength: 32 },
+    CLIENT_SIGN_KEY,
+    new TextEncoder().encode(stableJson)
+  );
+
+  const envelope = {
+    payload,
+    proof_sig_b64: toB64(new Uint8Array(proofSig))
+  };
+
+  const ciphertext = await encryptEnvelopeAsJwe(envelope, jweJwk);
+
+  const res = await fetch(APP_ORIGIN + '/req-key/register', {
+    method: 'POST',
+    mode: 'cors',
+    credentials: 'omit',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enc: 'jwe', kid: jweJwk.kid, ciphertext })
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error('registration failed: HTTP ' + res.status + ' ' + txt);
+  }
+
+  log('client key registered kid=' + CLIENT_REQ_KID + ' expires=' + payload.expires);
+}
+
+async function verifyResponseWithTimings(response, bodyBytes, method, targetUri) {
   if (!SIG_VERIFY_KEY) throw new Error('verification key not installed');
 
   const cd = response.headers.get('Content-Digest');
@@ -114,7 +337,7 @@ async function verifyResponseWithTimings(response, bodyText, method, targetUri) 
   const expectedB64 = parseDigestHeader(cd);
   if (!expectedB64) throw new Error('bad Content-Digest format');
 
-  const actualHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(bodyText));
+  const actualHash = await crypto.subtle.digest('SHA-256', bodyBytes);
   const actualB64 = toB64(new Uint8Array(actualHash));
   if (actualB64 !== expectedB64) throw new Error('digest mismatch');
 
@@ -141,314 +364,204 @@ async function verifyResponseWithTimings(response, bodyText, method, targetUri) 
   return true;
 }
 
-async function ensureFixedClientSigningKey() {
-  if (CLIENT_SIGN_KEY) return;
-  CLIENT_SIGN_KEY = await crypto.subtle.importKey(
-    'jwk',
-    CLIENT_REQ_PRIVATE_JWK,
-    { name: 'RSA-PSS', hash: { name: 'SHA-256' } },
-    false,
-    ['sign']
-  );
-}
-
-function buildSigInput(created) {
-  return `("@method" "@target-uri" "content-digest");created=${created};keyid="${CLIENT_REQ_KID}";alg="rsa-pss-sha256"`;
-}
-
-async function signRequestHeaders(method, targetUri, bodyBytes, headers) {
-  await ensureFixedClientSigningKey();
-  const created = Math.floor(Date.now() / 1000);
-
-  const hash = await crypto.subtle.digest('SHA-256', bodyBytes);
-  const cd = `sha-256=:${toB64(new Uint8Array(hash))}:`;
-  headers.set('Content-Digest', cd);
-
-  const sigInput = buildSigInput(created);
-
-  const base =
-    `x-client-key-id: ${CLIENT_REQ_KID}\n` +
-    `"@method": "${String(method).toLowerCase()}"\n` +
-    `"@target-uri": "${targetUri}"\n` +
-    `content-digest: ${cd}\n` +
-    `"@signature-params": ${sigInput}`;
-
-  const sig = await crypto.subtle.sign(
-    { name: 'RSA-PSS', saltLength: 32 },
-    CLIENT_SIGN_KEY,
-    new TextEncoder().encode(base)
-  );
-
-  headers.set('Signature-Input', `sig1=${sigInput}`);
-  headers.set('Signature', `sig1=:${toB64(new Uint8Array(sig))}:`);
-}
-
-async function registerClientKey(jweJwk) {
-  await ensureFixedClientSigningKey();
-
-  const now = Math.floor(Date.now() / 1000);
-  const pubJwk = {
-    kty: CLIENT_REQ_PRIVATE_JWK.kty,
-    kid: CLIENT_REQ_PRIVATE_JWK.kid,
-    use: CLIENT_REQ_PRIVATE_JWK.use,
-    alg: CLIENT_REQ_PRIVATE_JWK.alg,
-    key_ops: ['verify'],
-    ext: CLIENT_REQ_PRIVATE_JWK.ext,
-    n: CLIENT_REQ_PRIVATE_JWK.n,
-    e: CLIENT_REQ_PRIVATE_JWK.e
-  };
-
-  const payload = {
-    client_key_id: CLIENT_REQ_KID,
-    created: now,
-    expires: now + 86400,
-    sw_build: SW_BUILD,
-    pub_jwk: pubJwk
-  };
-
-  // Field order must match Server.java stableRegistrationJson() exactly
-  const stableJson = JSON.stringify({
-    client_key_id: payload.client_key_id,
-    created: payload.created,
-    expires: payload.expires,
-    sw_build: payload.sw_build,
-    pub_jwk: {
-      kty: pubJwk.kty,
-      kid: pubJwk.kid,
-      use: pubJwk.use,
-      alg: pubJwk.alg,
-      key_ops: pubJwk.key_ops,
-      ext: pubJwk.ext,
-      n: pubJwk.n,
-      e: pubJwk.e
-    }
-  });
-
-  const proofSig = await crypto.subtle.sign(
-    { name: 'RSA-PSS', saltLength: 32 },
-    CLIENT_SIGN_KEY,
-    new TextEncoder().encode(stableJson)
-  );
-  const proofSigB64 = toB64(new Uint8Array(proofSig));
-
-  const jweKey = await crypto.subtle.importKey(
-    'jwk',
-    { kty: 'RSA', n: jweJwk.n, e: jweJwk.e, alg: 'RSA-OAEP-256', ext: true, key_ops: ['encrypt'] },
-    { name: 'RSA-OAEP', hash: 'SHA-256' },
-    false,
-    ['encrypt']
-  );
-
-  const envelope = JSON.stringify({ payload, proof_sig_b64: proofSigB64 });
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: 'RSA-OAEP' },
-    jweKey,
-    new TextEncoder().encode(envelope)
-  );
-  const ciphertextB64 = toB64(new Uint8Array(ciphertext));
-
-  const res = await fetch(APP_ORIGIN + '/req-key/register', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      enc: 'rsa-oaep-256-json',
-      kid: jweJwk.kid,
-      ciphertext_b64: ciphertextB64
-    })
-  });
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    throw new Error('registration failed: HTTP ' + res.status + ' ' + txt);
-  }
-
-  log('client key registered kid=' + CLIENT_REQ_KID + ' expires=' + payload.expires);
-}
-
-self.addEventListener('install', () => {
+self.addEventListener('install', (event) => {
   log('SW install build=' + SW_BUILD);
-  self.skipWaiting();
+  event.waitUntil(
+    (async () => {
+      await self.skipWaiting();
+      await ensureClientSigningKey();
+    })()
+  );
 });
 
-self.addEventListener('activate', event => {
+self.addEventListener('activate', (event) => {
   log('SW activate build=' + SW_BUILD);
+  event.waitUntil(
+    (async () => {
+      await self.clients.claim();
+      await ensureClientSigningKey();
 
-  event.waitUntil((async () => {
-    await self.clients.claim();
-
-    const jwk = await loadSigJwk();
-    if (jwk) {
-      try {
-        SIG_VERIFY_KEY = await crypto.subtle.importKey(
-          'jwk',
-          jwk,
-          { name: 'RSA-PSS', hash: 'SHA-256' },
-          false,
-          ['verify']
-        );
-        log('restored SIG_VERIFY_KEY kid=' + (jwk.kid || '?'));
-      } catch (err) {
-        SIG_VERIFY_KEY = null;
-        log('failed restore key: ' + (err?.message || String(err)));
+      const jwk = await loadSigJwk();
+      if (jwk) {
+        try {
+          SIG_VERIFY_KEY = await crypto.subtle.importKey(
+            'jwk',
+            jwk,
+            { name: 'RSA-PSS', hash: 'SHA-256' },
+            false,
+            ['verify']
+          );
+          log('restored SIG_VERIFY_KEY kid=' + (jwk.kid || '?'));
+        } catch (err) {
+          SIG_VERIFY_KEY = null;
+          log('failed restore key: ' + (err?.message || String(err)));
+        }
       }
-    }
-  })());
+    })()
+  );
 });
 
-self.addEventListener('message', async e => {
-  if (e.data?.type === 'PING_SW') {
-    e.source?.postMessage?.({
-      type: 'PONG_SW',
-      sw_build: SW_BUILD,
-      script_url: self.registration?.active?.scriptURL || self.location.href
-    });
-    return;
-  }
+self.addEventListener('message', (event) => {
+  const data = event.data || {};
 
-  if (e.data?.type === 'REGISTER_CLIENT_KEY') {
-    registerClientKey(e.data.jweJwk)
-      .then(() => e.source?.postMessage?.({ type: 'REGISTER_OK', client_key_id: CLIENT_REQ_KID }))
-      .catch(err => e.source?.postMessage?.({ type: 'REGISTER_FAIL', message: err?.message || String(err) }));
-    return;
-  }
-
-  if (e.data?.type !== 'SET_SIG_KEY') return;
-
-  try {
-    const jwk = e.data.jwk;
-    SIG_VERIFY_KEY = await crypto.subtle.importKey(
-      'jwk',
-      jwk,
-      { name: 'RSA-PSS', hash: 'SHA-256' },
-      false,
-      ['verify']
+  if (data.type === 'PING_SW') {
+    event.waitUntil(
+      respond(event, {
+        type: 'PONG_SW',
+        sw_build: SW_BUILD,
+        script_url: self.registration?.active?.scriptURL || self.location.href,
+        client_key_id: CLIENT_REQ_KID
+      })
     );
+    return;
+  }
 
-    await saveSigJwk(jwk);
+  if (data.type === 'SET_SIG_KEY') {
+    event.waitUntil(
+      (async () => {
+        try {
+          const jwk = data.jwk;
 
-    e.source?.postMessage?.({
-      type: 'SIG_KEY_INSTALLED',
-      kid: jwk?.kid || '?',
-      sw_build: SW_BUILD
-    });
-  } catch (err) {
-    SIG_VERIFY_KEY = null;
-    e.source?.postMessage?.({
-      type: 'SIG_KEY_ERROR',
-      message: err?.message || String(err),
-      sw_build: SW_BUILD
-    });
+          SIG_VERIFY_KEY = await crypto.subtle.importKey(
+            'jwk',
+            jwk,
+            { name: 'RSA-PSS', hash: 'SHA-256' },
+            false,
+            ['verify']
+          );
+
+          await saveSigJwk(jwk);
+
+          await respond(event, {
+            type: 'SIG_KEY_INSTALLED',
+            kid: jwk?.kid || '?',
+            sw_build: SW_BUILD
+          });
+        } catch (err) {
+          SIG_VERIFY_KEY = null;
+          await respond(event, {
+            type: 'SIG_KEY_ERROR',
+            message: err?.message || String(err),
+            sw_build: SW_BUILD
+          });
+        }
+      })()
+    );
+    return;
+  }
+
+  if (data.type === 'REGISTER_CLIENT_KEY') {
+    event.waitUntil(
+      (async () => {
+        try {
+          await registerClientKey(data.jweJwk);
+          await respond(event, { type: 'REGISTER_OK', client_key_id: CLIENT_REQ_KID });
+        } catch (err) {
+          await respond(event, { type: 'REGISTER_FAIL', message: err?.message || String(err) });
+        }
+      })()
+    );
+    return;
   }
 });
 
-function shouldBypass(url) {
-  if (!url.protocol.startsWith('http')) return true;
-  if (url.origin !== self.location.origin) return true;
-  if (BOOTSTRAP_PATHS.has(url.pathname)) return true;
-  return false;
-}
-
-function buildUpstreamUrl(url) {
-  return APP_ORIGIN + url.pathname + url.search;
-}
-
-self.addEventListener('fetch', event => {
+self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
 
   if (shouldBypass(url)) return;
 
   if (url.pathname === '/metrics' || url.pathname === '/metrics/ingest') {
-    event.respondWith(new Response(JSON.stringify({
-      ok: false,
-      error: 'Metrics are no longer forwarded by the service worker. Send them directly to APP_ORIGIN /metrics/ingest.'
-    }), {
-      status: 410,
-      headers: { 'Content-Type': 'application/json' }
-    }));
+    event.respondWith(
+      new Response(
+        JSON.stringify({
+          ok: false,
+          error:
+            'Metrics are no longer forwarded by the service worker. Send them directly to APP_ORIGIN /metrics/ingest.'
+        }),
+        { status: 410, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
     return;
   }
 
-  event.respondWith((async () => {
-    const isUnsigned = url.pathname.startsWith('/unsigned/');
-    const runTag = getRunTagFromRequest(event.request);
+  event.respondWith(
+    (async () => {
+      try {
+        const req = event.request;
+        const isUnsigned = url.pathname.startsWith('/unsigned/');
+        const runTag = getRunTagFromRequest(req);
 
-    if (!SIG_VERIFY_KEY) {
-      if (url.pathname !== '/' && !BOOTSTRAP_PATHS.has(url.pathname)) {
-        return Response.redirect('/', 302);
+        if (!SIG_VERIFY_KEY || !CLIENT_SIGN_KEY || !CLIENT_REQ_KID) {
+          return Response.redirect('/baseline.html', 302);
+        }
+
+        let upstreamUrl = buildUpstreamUrl(url);
+        if (runTag) {
+          const u0 = new URL(upstreamUrl);
+          u0.searchParams.set('rt', runTag);
+          upstreamUrl = u0.toString();
+        }
+
+        let bodyBytes;
+        if (req.method === 'GET' || req.method === 'HEAD') {
+          bodyBytes = new Uint8Array(0);
+        } else {
+          bodyBytes = new Uint8Array(await req.clone().arrayBuffer());
+        }
+
+        const headers = new Headers();
+        const contentType = req.headers.get('Content-Type');
+        if (contentType && req.method !== 'GET' && req.method !== 'HEAD') headers.set('Content-Type', contentType);
+
+        const accept = req.headers.get('Accept');
+        if (accept) headers.set('Accept', accept);
+
+        const runTagHdr = req.headers.get('X-Run-Tag');
+        if (runTagHdr) headers.set('X-Run-Tag', runTagHdr);
+
+        const reqSeqHdr = req.headers.get('X-Req-Seq');
+        if (reqSeqHdr) headers.set('X-Req-Seq', reqSeqHdr);
+
+        const u = new URL(upstreamUrl);
+        const targetUri = u.pathname + u.search;
+
+        await signRequestHeaders(req.method, targetUri, bodyBytes, headers);
+
+        const signedReq = new Request(upstreamUrl, {
+          method: req.method,
+          headers,
+          body: req.method === 'GET' || req.method === 'HEAD' ? undefined : bodyBytes,
+          redirect: 'follow',
+          cache: 'no-store',
+          mode: 'cors',
+          credentials: 'omit'
+        });
+
+        const res = await fetch(signedReq);
+        const ct = res.headers.get('Content-Type') || '';
+
+        if (isUnsigned) return res;
+        if (res.type === 'opaque') return res;
+        if (!isProtectedContentType(ct)) return res;
+
+        const responseBytes = new Uint8Array(await res.clone().arrayBuffer());
+
+        await verifyResponseWithTimings(res, responseBytes, req.method, targetUri);
+
+        const outHeaders = new Headers(res.headers);
+        outHeaders.delete('content-length');
+
+        return new Response(responseBytes, {
+          status: res.status,
+          statusText: res.statusText,
+          headers: outHeaders
+        });
+      } catch (err) {
+        return new Response('SW proxy error: ' + (err?.message || String(err)), {
+          status: 502,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+        });
       }
-      return fetch(event.request);
-    }
-
-    let upstreamUrl = buildUpstreamUrl(url);
-    if (runTag) {
-      const u0 = new URL(upstreamUrl);
-      u0.searchParams.set('rt', runTag);
-      upstreamUrl = u0.toString();
-    }
-
-    const init = {
-      method: event.request.method,
-      redirect: 'follow',
-      credentials: 'omit',
-      cache: 'no-store'
-    };
-
-    let bodyBytes;
-    let bodyU8;
-
-    if (event.request.method !== 'GET' && event.request.method !== 'HEAD') {
-      bodyBytes = await event.request.clone().arrayBuffer();
-      bodyU8 = new Uint8Array(bodyBytes);
-      init.body = bodyU8;
-    } else {
-      bodyBytes = new Uint8Array(0).buffer;
-      bodyU8 = new Uint8Array(0);
-    }
-
-    const headers = new Headers();
-
-    const runTagHdr = event.request.headers.get('X-Run-Tag');
-    if (runTagHdr) headers.set('X-Run-Tag', runTagHdr);
-
-    const contentType = event.request.headers.get('Content-Type');
-    if (contentType && event.request.method !== 'GET' && event.request.method !== 'HEAD') {
-      headers.set('Content-Type', contentType);
-    }
-
-    const u = new URL(upstreamUrl);
-    const targetUri = u.pathname + u.search;
-
-    headers.set('X-Client-Key-Id', CLIENT_REQ_KID);
-    await signRequestHeaders(event.request.method, targetUri, bodyBytes, headers);
-    init.headers = headers;
-
-    let res;
-    try {
-      res = await fetch(upstreamUrl, init);
-    } catch (err) {
-      return new Response('Upstream fetch failed: ' + (err?.message || String(err)), {
-        status: 502,
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-      });
-    }
-
-    const ct = res.headers.get('Content-Type') || '';
-
-    if (isUnsigned) return res;
-    if (res.type === 'opaque') return res;
-    if (!isProtectedContentType(ct)) return res;
-
-    const text = await res.clone().text();
-
-    await verifyResponseWithTimings(res, text, event.request.method, targetUri);
-
-    const outHeaders = new Headers(res.headers);
-    outHeaders.delete('content-length');
-
-    return new Response(text, {
-      status: res.status,
-      statusText: res.statusText,
-      headers: outHeaders
-    });
-  })());
+    })()
+  );
 });

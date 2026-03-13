@@ -28,9 +28,10 @@ import java.util.regex.Pattern;
 public class Server {
 
     // === Keys and crypto ===
-    private static RSAPublicKey JWE_PUB;
-    private static RSAPrivateKey JWE_PRIV;
-    private static final String JWE_KID = "host-jwe-key-1";
+// === JWE key ring (supports rotation) ===
+    private static final Map<String, RSAPublicKey> JWE_PUBLIC_KEYS = new HashMap<>();
+    private static final Map<String, RSAPrivateKey> JWE_PRIVATE_KEYS = new HashMap<>();
+    private static String CURRENT_JWE_KID;
 
     private static RSAPublicKey SIG_PUB;
     private static RSAPrivateKey SIG_PRIV;
@@ -53,12 +54,10 @@ public class Server {
     // Paths that should NOT be request-verified
     private static final Set<String> UNVERIFIED_REQ_PATHS = Set.of(
             "/",
-            "/login.html",
-            "/index.html",
+            "/baseline.html",
             "/styles.css",
             "/favicon.ico",
 
-            "/baseline.html",
             "/assets/metrics-client.js",
             "/assets/metrics-debug.html",
 
@@ -93,7 +92,7 @@ public class Server {
         if (!Files.exists(METRICS_FILE)) Files.createFile(METRICS_FILE);
 
         System.out.println("== Host starting ==");
-        System.out.println("JWE key: " + JWE_KID);
+        System.out.println("JWE key: " + CURRENT_JWE_KID);
         System.out.println("SIG key: sig-key-1");
         System.out.println("Metrics file: " + METRICS_FILE.toAbsolutePath());
 
@@ -130,12 +129,12 @@ public class Server {
         contexts.addAll(List.of(ctxEcho, secured1));
 
         for (HttpContext ctx : contexts) {
-            ctx.getFilters().add(new ResponseSignerFilter());
             ctx.getFilters().add(new OptionsPreflightFilter());
             ctx.getFilters().add(new RequestVerifierFilter());
+            ctx.getFilters().add(new ResponseSignerFilter());
         }
 
-        http.setExecutor(null);
+        http.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(32));
         http.start();
         System.out.println("HTTP server running on http://0.0.0.0:8080");
     }
@@ -250,9 +249,14 @@ public class Server {
     private static byte[] getRequestBodyBytes(HttpExchange ex) throws IOException {
         Object o = ex.getAttribute("reqBodyBytes");
         if (o instanceof byte[]) return (byte[]) o;
-        byte[] b = ex.getRequestBody().readAllBytes();
-        ex.setAttribute("reqBodyBytes", b);
-        return b;
+
+        try (InputStream in = ex.getRequestBody();
+             ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+            in.transferTo(bos);
+            byte[] b = bos.toByteArray();
+            ex.setAttribute("reqBodyBytes", b);
+            return b;
+        }
     }
 
     private static String getRunTag(HttpExchange ex) {
@@ -289,7 +293,9 @@ public class Server {
         try {
             String path = ex.getRequestURI().getPath();
 
-            if ("/".equals(path) || "/login".equals(path)) {
+            if ("/".equals(path)) {
+                path = "/baseline.html";
+            } else if ("/login".equals(path)) {
                 path = "/login.html";
             } else if ("/index".equals(path)) {
                 path = "/index.html";
@@ -342,9 +348,13 @@ public class Server {
 
     private static void handleKeyExchange(HttpExchange ex) {
         try {
-            String n = b64urlUnsigned(JWE_PUB.getModulus().toByteArray());
-            String e = b64urlUnsigned(JWE_PUB.getPublicExponent().toByteArray());
-            String body = "{\"kty\":\"RSA\",\"kid\":\"" + JWE_KID + "\",\"n\":\"" + n + "\",\"e\":\"" + e + "\"}";
+            RSAPublicKey pub = JWE_PUBLIC_KEYS.get(CURRENT_JWE_KID);
+
+            String n = b64urlUnsigned(pub.getModulus().toByteArray());
+            String e = b64urlUnsigned(pub.getPublicExponent().toByteArray());
+
+            String body =
+                    "{\"kty\":\"RSA\",\"kid\":\"" + CURRENT_JWE_KID + "\",\"n\":\"" + n + "\",\"e\":\"" + e + "\"}";
             ex.setAttribute("handlerResult", HandlerResult.json(body));
         } catch (Exception e) {
             ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
@@ -365,28 +375,48 @@ public class Server {
 
             String enc = asString(req.get("enc"));
             String kid = asString(req.get("kid"));
-            String ciphertextB64 = asString(req.get("ciphertext_b64"));
 
-            if (!"rsa-oaep-256-json".equals(enc)) {
+            if (!"jwe".equals(enc)) {
                 ex.setAttribute("handlerResult",
                         HandlerResult.jsonStatus(400, "{\"ok\":false,\"error\":\"bad_enc\"}"));
                 return;
             }
 
-            if (!JWE_KID.equals(kid)) {
+            if (!CURRENT_JWE_KID.equals(kid)) {
                 ex.setAttribute("handlerResult",
                         HandlerResult.jsonStatus(400, "{\"ok\":false,\"error\":\"bad_kid\"}"));
                 return;
             }
 
-            if (ciphertextB64 == null || ciphertextB64.isBlank()) {
+            String ciphertext = asString(req.get("ciphertext"));
+
+            if (ciphertext == null || ciphertext.isBlank()) {
                 ex.setAttribute("handlerResult",
                         HandlerResult.jsonStatus(400, "{\"ok\":false,\"error\":\"missing_ciphertext\"}"));
                 return;
             }
 
-            byte[] plaintextBytes = rsaOaep256Decrypt(Base64.getDecoder().decode(ciphertextB64), JWE_PRIV);
-            String plaintextJson = new String(plaintextBytes, StandardCharsets.UTF_8);
+            String jweCompact = asString(req.get("ciphertext"));
+
+            if (jweCompact == null || jweCompact.isBlank()) {
+                ex.setAttribute("handlerResult",
+                        HandlerResult.jsonStatus(400, "{\"ok\":false,\"error\":\"missing_ciphertext\"}"));
+                return;
+            }
+
+            JsonWebEncryption jwe = new JsonWebEncryption();
+            jwe.setCompactSerialization(jweCompact);
+
+            String kidHeader = jwe.getKeyIdHeaderValue();
+            RSAPrivateKey priv = JWE_PRIVATE_KEYS.get(kidHeader);
+
+            if (priv == null) {
+                throw new SecurityException("unknown JWE kid " + kidHeader);
+            }
+
+            jwe.setKey(priv);
+
+            String plaintextJson = jwe.getPayload();
 
             Map<String, Object> env = OM.readValue(plaintextJson, Map.class);
             Map<String, Object> payload = castMap(env.get("payload"));
@@ -743,8 +773,9 @@ public class Server {
             reqMetric.put("req_body_bytes", bodyBytes.length);
             writeMetric(reqMetric);
 
-            String usernameEnc = jsonField(body, "username");
-            String passwordEnc = jsonField(body, "password");
+            Map<String, Object> reqObj = OM.readValue(body, Map.class);
+            String usernameEnc = asString(reqObj.get("username"));
+            String passwordEnc = asString(reqObj.get("password"));
 
             DecryptResult userDecrypt;
             DecryptResult passDecrypt;
@@ -825,8 +856,9 @@ public class Server {
             m.put("req_body_bytes", bodyBytes.length);
             writeMetric(m);
 
-            String user = jsonField(body, "username");
-            String pass = jsonField(body, "password");
+            Map<String, Object> reqObj = OM.readValue(body, Map.class);
+            String user = asString(reqObj.get("username"));
+            String pass = asString(reqObj.get("password"));
 
             boolean success = "alice".equalsIgnoreCase(user) && "secret".equals(pass);
             ex.setAttribute("handlerResult", HandlerResult.json(success ? "{\"ok\":true}" : "{\"ok\":false}"));
@@ -957,7 +989,7 @@ public class Server {
 
             String sigB64;
             try {
-                byte[] sig = signPss(base.getBytes(StandardCharsets.US_ASCII), SIG_PRIV);
+                byte[] sig = signPss(base.getBytes(StandardCharsets.UTF_8), SIG_PRIV);
                 sigB64 = Base64.getEncoder().encodeToString(sig);
             } catch (Exception e) {
                 ex.sendResponseHeaders(500, 0);
@@ -1025,6 +1057,8 @@ public class Server {
         System.out.println("[VERIFY] expected digest b64=" + expectedB64);
         System.out.println("[VERIFY] actual   digest b64=" + actualB64);
         System.out.println("[VERIFY] body length=" + body.length);
+        System.out.println("[VERIFY] body first32 b64=" +
+                Base64.getEncoder().encodeToString(Arrays.copyOf(body, Math.min(body.length, 32))));
         if (body.length > 0) {
             String preview = new String(body, StandardCharsets.UTF_8);
             System.out.println("[VERIFY] body preview=" + preview.substring(0, Math.min(preview.length(), 220)));
@@ -1068,7 +1102,12 @@ public class Server {
         try {
             JsonWebEncryption jwe = new JsonWebEncryption();
             jwe.setCompactSerialization(compact);
-            jwe.setKey(JWE_PRIV);
+            String kid = jwe.getKeyIdHeaderValue();
+            RSAPrivateKey priv = JWE_PRIVATE_KEYS.get(kid);
+
+            if (priv == null) throw new RuntimeException("Unknown JWE kid " + kid);
+
+            jwe.setKey(priv);
 
             long t0 = System.nanoTime();
             r.payload = jwe.getPayload();
@@ -1110,9 +1149,20 @@ public class Server {
     }
 
     private static void rotateJweKeypair() throws Exception {
-        RsaJsonWebKey j = RsaJwkGenerator.generateJwk(2048);
-        JWE_PUB = (RSAPublicKey) j.getPublicKey();
-        JWE_PRIV = (RSAPrivateKey) j.getPrivateKey();
+
+        RsaJsonWebKey jwk = RsaJwkGenerator.generateJwk(2048);
+
+        String kid = "host-jwe-key-" + System.currentTimeMillis();
+
+        RSAPublicKey pub = (RSAPublicKey) jwk.getPublicKey();
+        RSAPrivateKey priv = (RSAPrivateKey) jwk.getPrivateKey();
+
+        JWE_PUBLIC_KEYS.put(kid, pub);
+        JWE_PRIVATE_KEYS.put(kid, priv);
+
+        CURRENT_JWE_KID = kid;
+
+        System.out.println("Rotated JWE key → " + kid);
     }
 
     private static String jweEncrypt(String json) throws JoseException {
@@ -1120,8 +1170,10 @@ public class Server {
         jwe.setPayload(json);
         jwe.setAlgorithmHeaderValue(KeyManagementAlgorithmIdentifiers.RSA_OAEP_256);
         jwe.setEncryptionMethodHeaderParameter(ContentEncryptionAlgorithmIdentifiers.AES_256_GCM);
-        jwe.setKey(JWE_PUB);
-        jwe.setKeyIdHeaderValue(JWE_KID);
+        RSAPublicKey pub = JWE_PUBLIC_KEYS.get(CURRENT_JWE_KID);
+
+        jwe.setKey(pub);
+        jwe.setKeyIdHeaderValue(CURRENT_JWE_KID);
         return jwe.getCompactSerialization();
     }
 
