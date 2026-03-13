@@ -1,134 +1,140 @@
-// installer.js (fixed bootstrap: controller gating + timeout + one reload)
+// Trusted installer: bootstraps trust using DNS TXT pinning
 
-const METRICS_URL = 'https://app.masteroppgave2026.no/metrics';
+const out = document.getElementById('log');
 
-function log(...a){
-  console.log('[INSTALLER]',...a);
+function log(m) {
+  console.log('[INSTALL]', m);
+  out.textContent += '\n' + m;
+  out.scrollTop = out.scrollHeight;
 }
 
-async function postMetric(eventName, fields = {}) {
+const APP_ORIGIN = 'https://app.masteroppgave2026.no';
 
-  const payload = {
-    event:eventName,
-    at:new Date().toISOString(),
-    page:location.href,
-    ...fields
-  };
+// -------------------- DNS pin lookup --------------------
 
-  log('METRIC SEND', eventName, payload);
+async function fetchDNSPin() {
+  console.log('[INSTALL] VERSION = 2026-01-29');
+  log('[INSTALL] VERSION = 2026-01-29');
 
-  try {
+  log('Fetching SIG-PUB pin from DNS TXT (_sigpub.app.masteroppgave2026.no)…');
 
-    await fetch(METRICS_URL,{
-      method:'POST',
-      mode:'no-cors',
-      body:JSON.stringify(payload)
-    });
+  const r = await fetch(
+    'https://cloudflare-dns.com/dns-query?name=_sigpub.app.masteroppgave2026.no&type=TXT',
+    {
+      headers: { accept: 'application/dns-json' },
+      cache: 'no-store'
+    }
+  );
 
-    log('METRIC SENT', eventName);
+  const j = await r.json();
+  const raw = j.Answer?.[0]?.data?.replace(/"/g, '');
 
-  } catch(e){
+  if (!raw) throw new Error('DNS pin missing');
 
-    log('METRIC ERROR',eventName,e);
-  }
+  const parts = Object.fromEntries(
+    raw.split(';').map(p => p.split('=', 2))
+  );
+
+  if (parts.v !== '1') throw new Error('Unsupported DNS pin version');
+  if (!parts.kid || !parts.sha256) throw new Error('DNS pin missing kid or sha256');
+
+  log(`DNS pin loaded (kid=${parts.kid})`);
+  return { kid: parts.kid, sha256: parts.sha256 };
 }
 
-async function fetchSigPubJwkFromApp() {
-  const r = await fetch('https://app.masteroppgave2026.no/sig-pub', {
+// -------------------- Hash helper --------------------
+
+async function hashJWK(jwk) {
+  const canonical = JSON.stringify({ kty: jwk.kty, n: jwk.n, e: jwk.e });
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+  return btoa(String.fromCharCode(...new Uint8Array(buf)));
+}
+
+function normalizeB64(s) {
+  return s.replace(/=+$/, '');
+}
+
+// Wait until SW confirms it imported the key
+function waitForSWKeyAck(expectedKid, timeoutMs = 4000) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      navigator.serviceWorker.removeEventListener('message', onMsg);
+      reject(new Error('Timed out waiting for SW key install ack'));
+    }, timeoutMs);
+
+    function onMsg(ev) {
+      if (ev?.data?.type === 'SIG_KEY_INSTALLED' && ev.data.kid === expectedKid) {
+        clearTimeout(t);
+        navigator.serviceWorker.removeEventListener('message', onMsg);
+        resolve(true);
+      }
+      if (ev?.data?.type === 'SIG_KEY_ERROR') {
+        clearTimeout(t);
+        navigator.serviceWorker.removeEventListener('message', onMsg);
+        reject(new Error('SW failed to install key: ' + (ev.data.message || 'unknown')));
+      }
+    }
+
+    navigator.serviceWorker.addEventListener('message', onMsg);
+  });
+}
+
+// -------------------- Main installer flow --------------------
+
+async function main() {
+  log('Installer started');
+
+  // 1) DNS pin
+  const pinned = await fetchDNSPin();
+
+  // 2) Fetch signature public key from app origin (requires strict CORS on app.*)
+  log('Fetching /sig-pub from app origin…');
+  const r = await fetch(APP_ORIGIN + '/sig-pub', {
     cache: 'no-store',
-    mode: 'cors',
-    credentials: 'omit',
-  });
-  if (!r.ok) throw new Error('sig-pub HTTP ' + r.status);
-  return await r.json();
-}
-
-function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-async function waitForController(timeoutMs = 2500) {
-  const start = performance.now();
-  while (!navigator.serviceWorker.controller) {
-    if (performance.now() - start > timeoutMs) return false;
-    await sleep(50);
-  }
-  return true;
-}
-
-async function install() {
-
-  // Already installed? Skip installer completely
-  if (navigator.serviceWorker.controller) {
-    location.replace('/');
-    return;
-  }
-
-  const t0 = performance.now();
-
-  if (!('serviceWorker' in navigator)) {
-    await postMetric('sw_install_unsupported', {});
-    return;
-  }
-
-  // 1) Register
-    const swInstallStart = performance.now();
-
-    const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
-
-    await navigator.serviceWorker.ready;
-
-    const swInstallMs = performance.now() - swInstallStart;
-
-    await postMetric('sw_install_complete', {
-      sw_install_total_ms: Math.round(swInstallMs)
-    });
-
-  // 2) Ensure the page is controlled (or reload once)
-  let controlled = await waitForController(2000);
-
-  if (!controlled && !sessionStorage.getItem('__sw_reloaded_once')) {
-    sessionStorage.setItem('__sw_reloaded_once', '1');
-    await postMetric('sw_force_reload', { note: 'No controller yet; reloading once to get control.' });
-    location.reload();
-    return; // stop here; next load should be controlled
-  }
-
-  controlled = await waitForController(2000);
-  await postMetric('sw_controlled', { controlled });
-
-  // 3) Fetch JWK
-  const jwk = await fetchSigPubJwkFromApp();
-
-  // 4) Send key to SW + wait ACK
-  const controller = navigator.serviceWorker.controller;
-  const target = controller || reg.active;
-  if (!target) throw new Error('No active SW to message');
-
-  const ack = new Promise((resolve, reject) => {
-    const to = setTimeout(() => reject(new Error('SIG_KEY_INSTALLED timeout')), 5000);
-    navigator.serviceWorker.addEventListener('message', function onMsg(e) {
-      if (e.data?.type === 'SIG_KEY_INSTALLED') {
-        clearTimeout(to);
-        navigator.serviceWorker.removeEventListener('message', onMsg);
-        resolve(e.data);
-      }
-      if (e.data?.type === 'SIG_KEY_ERROR') {
-        clearTimeout(to);
-        navigator.serviceWorker.removeEventListener('message', onMsg);
-        reject(new Error(e.data.message || 'SIG_KEY_ERROR'));
-      }
-    });
+    mode: 'cors'
   });
 
-  const tKey0 = performance.now();
-  target.postMessage({ type: 'SET_SIG_KEY', jwk });
-  await ack;
-  await postMetric('sw_key_install', { sw_key_install_ms: Math.round(performance.now() - tKey0), kid: jwk?.kid });
+  if (!r.ok) throw new Error('Failed to fetch /sig-pub (HTTP ' + r.status + ')');
 
-  await postMetric('sw_bootstrap_total', { sw_bootstrap_total_ms: Math.round(performance.now() - t0) });
-  location.replace('/');
+  const jwk = await r.json();
+  log(`Got SIG-PUB (kid=${jwk.kid})`);
+
+  const now = Math.floor(Date.now() / 1000);
+  if (jwk.created > now + 60) throw new Error('SIG-PUB created in the future');
+  if (jwk.expires < now) throw new Error('SIG-PUB expired');
+  if (jwk.kid !== pinned.kid) throw new Error(`KID mismatch: DNS=${pinned.kid}, SIG-PUB=${jwk.kid}`);
+
+  // 3) Verify key material
+  const localHash = await hashJWK(jwk);
+  if (normalizeB64(localHash) !== normalizeB64(pinned.sha256)) {
+    throw new Error('MITM detected: SIG-PUB hash mismatch');
+  }
+  log('SIG-PUB verified against DNS pin');
+
+  // 4) Register Service Worker
+  if (!('serviceWorker' in navigator)) throw new Error('ServiceWorker not supported');
+
+  log('Registering Service Worker /sw.js …');
+  const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+  await navigator.serviceWorker.ready;
+  log('Service Worker ready');
+
+  const active = reg.active || reg.waiting || reg.installing;
+  if (!active) throw new Error('No active Service Worker instance');
+
+  // 5) Deliver verified key to SW + wait for ack
+  log('Sending verified key to Service Worker');
+  const ackPromise = waitForSWKeyAck(jwk.kid, 4000);
+  active.postMessage({ type: 'SET_SIG_KEY', jwk });
+  await ackPromise;
+  log('Service Worker confirmed key installed');
+
+  // 6) Enter protected application (same apex URL; SW will fetch verified bytes from app.*)
+  log('Redirecting to /login.html …');
+  location.replace('/login.html');
 }
 
-install().catch(async (e) => {
-  await postMetric('sw_bootstrap_error', { err: e?.message || String(e) });
-  console.error(e);
+main().catch(err => {
+  log('FATAL: ' + (err?.message || err));
+  console.error(err);
 });

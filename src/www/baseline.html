@@ -9,8 +9,15 @@
         .card { max-width: 720px; padding:1rem; border:1px solid #ddd; border-radius:.5rem; }
         .row { display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; }
         .logbox {
-          background:#0b1020; color:#d0d7ff; padding:1rem; border-radius:.5rem;
-          max-height:260px; overflow:auto; font-size:.85rem; white-space:pre-wrap; word-break:break-word;
+          background:#0b1020;
+          color:#d0d7ff;
+          padding:1rem;
+          border-radius:.5rem;
+          max-height:260px;
+          overflow:auto;
+          font-size:.85rem;
+          white-space:pre-wrap;
+          word-break:break-word;
         }
         input[type="number"] { width: 120px; }
     </style>
@@ -20,8 +27,8 @@
 
 <div class="card">
     <div class="row">
-        <label>Username <input id="user" value="alice" /></label>
-        <label>Password <input id="pass" type="password" value="secret" /></label>
+        <label>Username <input id="user" value="alice"></label>
+        <label>Password <input id="pass" type="password" value="secret"></label>
     </div>
 
     <div class="row" style="margin-top:.5rem">
@@ -38,98 +45,114 @@
 <script>
     const APP_ORIGIN = 'https://app.masteroppgave2026.no';
     const METRICS_URL = APP_ORIGIN + '/metrics';
+    const out = document.getElementById('log');
 
-    function nowIso(){ return new Date().toISOString(); }
+    function log(...args){
+      out.textContent += `[${new Date().toISOString()}] ${args.join(' ')}\n`;
+      out.scrollTop = out.scrollHeight;
+    }
+
     function utf8Bytes(str){ return new TextEncoder().encode(str).length; }
 
-  async function postMetric(eventName, fields = {}) {
+    function makePad(n) {
+      n = Number(n) | 0;
+      if (n <= 0) return '';
+      return 'x'.repeat(n);
+    }
 
-  const payload = {
-    event:eventName,
-    at:new Date().toISOString(),
-    page_url:location.href,
-    origin:location.origin,
-    ...fields
-  };
+    async function postMetric(eventName, fields = {}) {
+      const payload = {
+        event:eventName,
+        at:new Date().toISOString(),
+        page_url:location.href,
+        origin:location.origin,
+        source:'page',
+        ...fields
+      };
 
-  console.log('[BASELINE] METRIC SEND',eventName,payload);
-
-  try{
-
-    await fetch(METRICS_URL,{
-      method:'POST',
-      mode:'no-cors',
-      body:JSON.stringify(payload)
-    });
-
-    console.log('[BASELINE] METRIC SENT',eventName);
-
-  }catch(e){
-
-    console.error('[BASELINE] METRIC ERROR',eventName,e);
-
-  }
-}
-
-      async function doBaselineOnce({ runTag, iter }){
-        const u = document.getElementById('user').value || '';
-        const p = document.getElementById('pass').value || '';
-        const padN = Number(document.getElementById('padBytes')?.value || 0) | 0;
-        const pad = makePad(padN);
-
-        const bodyObj = { username: u, password: p, pad };
-        const bodyStr = JSON.stringify(bodyObj);
-
-        const t0 = performance.now();
-          const r = await fetch('/api/login_plain', {
-            method:'POST',
-            headers:{
-              'Content-Type':'application/json',
-              'X-Run-Tag': runTag || ''
-            },
-            body: bodyStr
-          });
-        const fetchMs = performance.now() - t0;
-
-        const txt = await r.text();
-        await postMetric('baseline_login_request', {
-          runTag, iter,
-          pad_bytes: padN,
-          http_status: r.status,
-          login_fetch_ms: Math.round(fetchMs),
-          login_req_body_bytes: utf8Bytes(bodyStr),
-          login_resp_body_bytes: utf8Bytes(txt)
+      try {
+        await fetch(METRICS_URL,{
+          method:'POST',
+          mode:'no-cors',
+          cache:'no-store',
+          headers:{ 'Content-Type':'application/json' },
+          body:JSON.stringify(payload)
         });
-
-        let j=null; try{ j=JSON.parse(txt);}catch{}
-        return { ok: !!j?.ok, status: r.status };
+      } catch(e) {
+        console.error('[BASELINE] METRIC ERROR', eventName, e);
       }
+    }
 
-      async function runBaselineBench(n=30){
-        const runTag = `baseline-${Date.now()}`;
+    async function doBaselineOnce({ runTag, iter }){
+      const u = document.getElementById('user').value || '';
+      const p = document.getElementById('pass').value || '';
+      const padN = Number(document.getElementById('padBytes')?.value || 0) | 0;
+      const pad = makePad(padN);
 
-        await postMetric('baseline_bench_start', { runTag, n });
+      const bodyObj = { username: u, password: p, pad };
+      const bodyStr = JSON.stringify(bodyObj);
 
-        let okCount=0;
-        for (let i=1;i<=n;i++){
-          try{
-            const res = await doBaselineOnce({ runTag, iter:i });
-            if(res.ok) okCount++;
-
-          }catch(e){
-
-            await postMetric('baseline_iter_error', { runTag, iter:i, err: e?.message || String(e) });
-          }
-          await new Promise(r=>setTimeout(r,50));
-        }
-
-        await postMetric('baseline_bench_done', { runTag, n, okCount });
-      }
-
-      document.getElementById('benchBtn').addEventListener('click', e => {
-        e.preventDefault();
-        runBaselineBench(30);
+      const t0 = performance.now();
+      const r = await fetch('/api/login_plain', {
+        method:'POST',
+        headers:{
+          'Content-Type':'application/json',
+          'X-Run-Tag': runTag || '',
+          'X-Req-Seq': String(iter || ''),
+          'X-Bench-Kind': 'baseline-login'
+        },
+        body: bodyStr
       });
+      const fetchMs = performance.now() - t0;
+
+      const txt = await r.text();
+
+      await postMetric('baseline_login_request', {
+        runTag, iter,
+        pad_bytes: padN,
+        http_status: r.status,
+        login_fetch_ms: Number(fetchMs.toFixed(2)),
+        login_req_body_bytes: utf8Bytes(bodyStr),
+        login_resp_body_bytes: utf8Bytes(txt),
+        host_req_header_bytes: Number(r.headers.get('X-Metric-Req-Header-Bytes') || 0),
+        host_req_body_bytes: Number(r.headers.get('X-Metric-Req-Body-Bytes') || 0)
+      });
+
+      let j = null;
+      try { j = JSON.parse(txt); } catch {}
+      return { ok: !!j?.ok, status: r.status };
+    }
+
+    async function runBaselineBench(n=30){
+      const runTag = `baseline-${Date.now()}`;
+      log('Starting baseline benchmark', runTag);
+
+      await postMetric('baseline_bench_start', { runTag, n });
+
+      let okCount = 0;
+      for (let i = 1; i <= n; i++) {
+        try {
+          const res = await doBaselineOnce({ runTag, iter:i });
+          if (res.ok) okCount++;
+        } catch (e) {
+          log('Iter failed', i, e?.message || String(e));
+          await postMetric('baseline_iter_error', {
+            runTag,
+            iter:i,
+            err: e?.message || String(e)
+          });
+        }
+        await new Promise(r => setTimeout(r,50));
+      }
+
+      await postMetric('baseline_bench_done', { runTag, n, okCount });
+      log('Baseline benchmark done', runTag, 'okCount=', okCount);
+    }
+
+    document.getElementById('benchBtn').addEventListener('click', e => {
+      e.preventDefault();
+      runBaselineBench(30);
+    });
 </script>
 </body>
 </html>

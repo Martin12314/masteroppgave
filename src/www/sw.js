@@ -1,85 +1,117 @@
-// sw.js
-// Purpose:
-// - proxy same-origin app requests to APP_ORIGIN
-// - sign upstream requests
-// - verify signed protected responses
-// - DO NOT proxy metrics anymore
-// - metrics must be sent directly to APP_ORIGIN from the page
+// sw.js — Service Worker for apex origin
+// Enforces integrity using Content-Digest + HTTP Message Signatures
+// Also records benchmark metrics to app origin /metrics
 
 let SIG_VERIFY_KEY = null;
-let CLIENT_SIGN_KEY = null;
 
-const SW_BUILD = '2026-03-12-no-metrics-forward-v2';
-
-const CLIENT_REQ_KID = 'client-req-1';
 const APP_ORIGIN = 'https://app.masteroppgave2026.no';
+const METRICS_URL = APP_ORIGIN + '/metrics';
 
 const BOOTSTRAP_PATHS = new Set([
   '/sw.js',
   '/Installer.js',
   '/installer.js',
-  '/favicon.ico'
 ]);
-
-const CONFIG_CACHE = 'sw-config-v1';
-const SIG_CACHE_KEY = '/__sig_verify_jwk.json';
-
-const CLIENT_REQ_PRIVATE_JWK = {
-  kty: "RSA",
-  kid: "client-req-1",
-  use: "sig",
-  alg: "PS256",
-  key_ops: ["sign"],
-  ext: true,
-  n: "u31RCl3cGubeBaacyzc00o5jLnBlfNefG1sKCVQdNSSDJdOFJ96oS7oIlL31qEQM1hDCH3MIqZHwHzgTpAXfLZDaJme-GPDT8tJCj8jfbCMVpeGQMbV9N6N7nlQOk8MJEK8TeS8fK3I4M2QiZngbhKDEhNAejiaMvuqWd60RAM1UwsEY_XBNWPFO3Ig9uROrDyfQdu1LCD9tFsBzVBn-O-eFdEVa0wO4LMdQmGgEl6xFfEnNC36TFR7_TZJEuHuBS_rLtUVIy1arPUInN1snPkcBzadklNYpvT1szuMghVJES_-HQKgs_19KdA-4f1nezprTBQYrtMyBfGnCoM8JCQ",
-  e: "AQAB",
-  d: "GwlCpu6K_1wcVw9EG-_Nj7FVrwwpLlv_hxfVNiwpfBDUUp-SW4H5ndXpR92ur4GEolfPTm6tqJoxWKci-euY177EHnamTH1p6uGUFJzgTv0uMXn565kiweOyv02avocI5x1__uEjKwYxAYQmi8U1HqZ6QDasuU3ozN0SLpbH1WgHIWNGOuMZivcYG5qWAnS7-IGYo69JFLiH6j685qZb4GUmZSzzvB7R5AkgMkihxobur1JLBTY_dUVl1at7cbAF8uJ3GvnUtUXUMql8T0NHHJJegLah2UD4d3hliCxV9XO-JkBV-SNAmVAJh1mQMC41Jt_Jbmt__nAKwqU3448rUw",
-  p: "x0NDaJ0sdsuVwAy7_3E6N2Mb220Hroq0nu2-gr9MPkIhzmPFCLPu8BirRhXq9Nm8RXmDyZqBvgBbMZCJN5Vl99IQSK7iS2G2V4ZWkaKKOVmBb9P373_6PHDCTHNjVhhe1z1MEaYZdYqHTFC6PVEKBJvbiIW9rDqL6id3bxZ5F_c",
-  q: "8N_f3juGJxWmWOZzvfYTfbAz9oVa19rOD_pQ_l9S7gvd4jwXPzK4B7oYDYFlZef8nhevuVBB50i5euZgnKJD_XjEYo-a8ySr5QR_LUUv5DaspZJWy4KuSlX6rC-6TF_7yym_0bgM_zLWwD5rgMuQRfswurucdg1sWOa5WD8Kpv8",
-  dp: "Sn6OE-02s07XNE5OdmgpQI2v22--gHVgo030fELySRBGPTe1cNR8Dozac0A8b797EGomZ9d4i8TsUvJbKkmTLnv9FH81IMNt_Pi_IoEmtdwNdPZE6efpcHEjYpt81rITutoytyJmwDfC7zf6-HN0kFaIU1jUmS_mIOsSTpiTOu8",
-  dq: "rqAfFGXi5AL2Dg1Ea7sydjR_94DGUyb1rO-0ODWzUZCY06Ls14xVjoSDW4crk62TnqldY-OjY6F9lnPeJrAcym37MdkaZJt5YxbXfGJkTfa1Q3PMKM4cvReIG7yeOzB6wtcJkWj1Qy4AMm8OUNlDRvjMYxQQYiVpHyplxGwvtNE",
-  qi: "IAFKq9qRqX3D--euRvDbPMN8WT2PWZxBeXCu8AtvCckjqlUapBBKT00FDRGX74I2RbaPpKLXVSMUNYTkTnM8XpIak_FC3GjjYXKvWo--Y8HjUab6klcX_-yJkxQI1Dvjvn5YHAKY8U8nzwP-QCL-6Z567gm1dRPvOlFEY5TDEY0"
-};
-
-async function saveSigJwk(jwk) {
-  const c = await caches.open(CONFIG_CACHE);
-  await c.put(SIG_CACHE_KEY, new Response(JSON.stringify(jwk), {
-    headers: { 'Content-Type': 'application/json' }
-  }));
-}
-
-async function loadSigJwk() {
-  const c = await caches.open(CONFIG_CACHE);
-  const r = await c.match(SIG_CACHE_KEY);
-  if (!r) return null;
-  try { return await r.json(); } catch { return null; }
-}
 
 function log(...args) {
   const msg = args.join(' ');
   console.log('[SW]', msg);
+
   self.clients.matchAll({ includeUncontrolled: true }).then(clients => {
     for (const client of clients) {
-      client.postMessage({ type: 'SW_LOG', message: msg, ts: new Date().toISOString() });
+      client.postMessage({
+        type: 'SW_LOG',
+        message: msg,
+        ts: new Date().toISOString()
+      });
     }
   });
 }
 
-function getRunTagFromRequest(req) {
-  const v = req.headers.get('X-Run-Tag');
-  return v && v.trim() ? v.trim() : null;
+function ms3(v) {
+  return Number(Number(v).toFixed(3));
 }
 
-function toB64(bytes) {
-  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  let s = '';
-  for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
-  return btoa(s);
+function shouldBypassSecurity(url) {
+  return (
+    url.searchParams.get('sw-bypass') === '1' ||
+    url.pathname.startsWith('/unsigned/')
+  );
 }
+
+async function postMetric(eventName, fields = {}) {
+  const payload = {
+    event: eventName,
+    at: new Date().toISOString(),
+    source: 'service-worker',
+    ...fields
+  };
+
+  try {
+    await fetch(METRICS_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  } catch (e) {
+    console.warn('[SW] metric send failed', e);
+  }
+}
+
+self.addEventListener('install', event => {
+  log('install → skipWaiting');
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', event => {
+  log('activate → clients.claim');
+  event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener('message', async event => {
+  if (event.data?.type !== 'SET_SIG_KEY') return;
+
+  try {
+    SIG_VERIFY_KEY = await crypto.subtle.importKey(
+      'jwk',
+      event.data.jwk,
+      { name: 'RSA-PSS', hash: 'SHA-256' },
+      false,
+      ['verify']
+    );
+
+    const kid = event.data.jwk?.kid || '?';
+    log('signature verification key installed (kid=' + kid + ')');
+
+    if (event.source && typeof event.source.postMessage === 'function') {
+      event.source.postMessage({ type: 'SIG_KEY_INSTALLED', kid });
+    }
+  } catch (e) {
+    SIG_VERIFY_KEY = null;
+    const msg = e?.message || String(e);
+    log('ERROR installing signature key:', msg);
+
+    if (event.source && typeof event.source.postMessage === 'function') {
+      event.source.postMessage({ type: 'SIG_KEY_ERROR', message: msg });
+    }
+  }
+});
 
 function b64ToBytes(b64) {
   const bin = atob(b64);
   return Uint8Array.from(bin, c => c.charCodeAt(0));
+}
+
+function bytesToB64(bytes) {
+  let bin = '';
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < arr.length; i += chunkSize) {
+    bin += String.fromCharCode(...arr.subarray(i, i + chunkSize));
+  }
+  return btoa(bin);
 }
 
 function parseDigestHeader(cd) {
@@ -94,32 +126,55 @@ function parseSigHeader(sig) {
 
 function isProtectedContentType(ct) {
   ct = (ct || '').toLowerCase();
-  return ct.includes('text/html') ||
-         ct.includes('application/json') ||
-         ct.includes('application/javascript') ||
-         ct.includes('text/javascript');
+  return (
+    ct.includes('text/html') ||
+    ct.includes('application/json') ||
+    ct.includes('application/javascript') ||
+    ct.includes('text/javascript') ||
+    ct.includes('text/css') ||
+    ct.includes('image/png') ||
+    ct.includes('image/jpeg') ||
+    ct.includes('image/webp') ||
+    ct.includes('image/svg+xml')
+  );
 }
 
-async function verifyResponseWithTimings(response, bodyText, method, targetUri) {
+function getReqHeader(name, headers) {
+  try {
+    return headers.get(name);
+  } catch {
+    return null;
+  }
+}
+
+async function verifyResponse(response, bodyBytes, method, targetUri) {
   if (!SIG_VERIFY_KEY) throw new Error('verification key not installed');
 
   const cd = response.headers.get('Content-Digest');
   const sig = response.headers.get('Signature');
   const sigInput = response.headers.get('Signature-Input');
 
-  if (!cd) throw new Error('missing Content-Digest');
-  if (!sig) throw new Error('missing Signature');
-  if (!sigInput) throw new Error('missing Signature-Input');
+  if (!cd || !sig || !sigInput) {
+    throw new Error('missing security headers (need Content-Digest + Signature + Signature-Input)');
+  }
+
+  const digestStarted = performance.now();
 
   const expectedB64 = parseDigestHeader(cd);
   if (!expectedB64) throw new Error('bad Content-Digest format');
 
-  const actualHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(bodyText));
-  const actualB64 = toB64(new Uint8Array(actualHash));
-  if (actualB64 !== expectedB64) throw new Error('digest mismatch');
+  const actualHash = await crypto.subtle.digest('SHA-256', bodyBytes);
+  const actualB64 = bytesToB64(actualHash);
+
+  if (actualB64 !== expectedB64) {
+    throw new Error('digest mismatch');
+  }
+
+  const digestMs = performance.now() - digestStarted;
+
+  const sigStarted = performance.now();
 
   const params = sigInput.replace(/^sig1=/, '');
-
   const base =
     `"@method": "${String(method).toLowerCase()}"\n` +
     `"@target-uri": "${targetUri}"\n` +
@@ -137,227 +192,219 @@ async function verifyResponseWithTimings(response, bodyText, method, targetUri) 
     new TextEncoder().encode(base)
   );
 
+  const sigMs = performance.now() - sigStarted;
+
   if (!ok) throw new Error('signature verification failed');
-  return true;
-}
 
-async function ensureFixedClientSigningKey() {
-  if (CLIENT_SIGN_KEY) return;
-  CLIENT_SIGN_KEY = await crypto.subtle.importKey(
-    'jwk',
-    CLIENT_REQ_PRIVATE_JWK,
-    { name: 'RSA-PSS', hash: { name: 'SHA-256' } },
-    false,
-    ['sign']
-  );
-}
-
-function buildSigInput(created) {
-  return `("@method" "@target-uri" "content-digest");created=${created};keyid="${CLIENT_REQ_KID}";alg="rsa-pss-sha256"`;
-}
-
-async function signRequestHeaders(method, targetUri, bodyBytes, headers) {
-  await ensureFixedClientSigningKey();
-  const created = Math.floor(Date.now() / 1000);
-
-  const hash = await crypto.subtle.digest('SHA-256', bodyBytes);
-  const cd = `sha-256=:${toB64(new Uint8Array(hash))}:`;
-  headers.set('Content-Digest', cd);
-
-  const sigInput = buildSigInput(created);
-
-  const base =
-    `"@method": "${String(method).toLowerCase()}"\n` +
-    `"@target-uri": "${targetUri}"\n` +
-    `content-digest: ${cd}\n` +
-    `"@signature-params": ${sigInput}`;
-
-  const sig = await crypto.subtle.sign(
-    { name: 'RSA-PSS', saltLength: 32 },
-    CLIENT_SIGN_KEY,
-    new TextEncoder().encode(base)
-  );
-
-  headers.set('Signature-Input', `sig1=${sigInput}`);
-  headers.set('Signature', `sig1=:${toB64(new Uint8Array(sig))}:`);
-}
-
-self.addEventListener('install', () => {
-  log('SW install build=' + SW_BUILD);
-  self.skipWaiting();
-});
-
-self.addEventListener('activate', event => {
-  log('SW activate build=' + SW_BUILD);
-
-  event.waitUntil((async () => {
-    await self.clients.claim();
-
-    const jwk = await loadSigJwk();
-    if (jwk) {
-      try {
-        SIG_VERIFY_KEY = await crypto.subtle.importKey(
-          'jwk',
-          jwk,
-          { name: 'RSA-PSS', hash: 'SHA-256' },
-          false,
-          ['verify']
-        );
-        log('restored SIG_VERIFY_KEY kid=' + (jwk.kid || '?'));
-      } catch (err) {
-        SIG_VERIFY_KEY = null;
-        log('failed restore key: ' + (err?.message || String(err)));
-      }
-    }
-  })());
-});
-
-self.addEventListener('message', async e => {
-  if (e.data?.type === 'PING_SW') {
-    e.source?.postMessage?.({
-      type: 'PONG_SW',
-      sw_build: SW_BUILD,
-      script_url: self.registration?.active?.scriptURL || self.location.href
-    });
-    return;
-  }
-
-  if (e.data?.type !== 'SET_SIG_KEY') return;
-
-  try {
-    const jwk = e.data.jwk;
-    SIG_VERIFY_KEY = await crypto.subtle.importKey(
-      'jwk',
-      jwk,
-      { name: 'RSA-PSS', hash: 'SHA-256' },
-      false,
-      ['verify']
-    );
-
-    await saveSigJwk(jwk);
-
-    e.source?.postMessage?.({
-      type: 'SIG_KEY_INSTALLED',
-      kid: jwk?.kid || '?',
-      sw_build: SW_BUILD
-    });
-  } catch (err) {
-    SIG_VERIFY_KEY = null;
-    e.source?.postMessage?.({
-      type: 'SIG_KEY_ERROR',
-      message: err?.message || String(err),
-      sw_build: SW_BUILD
-    });
-  }
-});
-
-function shouldBypass(url) {
-  if (!url.protocol.startsWith('http')) return true;
-  if (url.origin !== self.location.origin) return true;
-  if (BOOTSTRAP_PATHS.has(url.pathname)) return true;
-  return false;
-}
-
-function buildUpstreamUrl(url) {
-  return APP_ORIGIN + url.pathname + url.search;
+  return {
+    digestMs,
+    sigMs,
+    totalMs: digestMs + sigMs
+  };
 }
 
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
 
-  if (shouldBypass(url)) return;
-
-  if (url.pathname === '/metrics' || url.pathname === '/metrics/ingest') {
-    event.respondWith(new Response(JSON.stringify({
-      ok: false,
-      error: 'Metrics are no longer forwarded by the service worker. Send them directly to APP_ORIGIN /metrics/ingest.'
-    }), {
-      status: 410,
-      headers: { 'Content-Type': 'application/json' }
-    }));
-    return;
-  }
+  if (!url.protocol.startsWith('http')) return;
+  if (url.origin !== self.location.origin) return;
+  if (BOOTSTRAP_PATHS.has(url.pathname)) return;
 
   event.respondWith((async () => {
-    const isUnsigned = url.pathname.startsWith('/unsigned/');
-    const runTag = getRunTagFromRequest(event.request);
+    const started = performance.now();
+
+    // Explicit bypass mode for baseline benchmarks
+    if (shouldBypassSecurity(url)) {
+      const upstreamUrl = APP_ORIGIN + url.pathname + url.search;
+
+      const init = {
+        method: event.request.method,
+        redirect: 'follow',
+        credentials: 'omit',
+        headers: new Headers()
+      };
+
+      const forwarded = [
+        'Content-Type',
+        'X-Run-Tag',
+        'X-Req-Seq',
+        'X-Bench-Kind'
+      ];
+
+      for (const h of forwarded) {
+        const v = getReqHeader(h, event.request.headers);
+        if (v) init.headers.set(h, v);
+      }
+
+      if (event.request.method !== 'GET' && event.request.method !== 'HEAD') {
+        init.body = await event.request.clone().arrayBuffer();
+        if (!init.headers.has('Content-Type')) {
+          init.headers.set(
+            'Content-Type',
+            event.request.headers.get('Content-Type') || 'application/octet-stream'
+          );
+        }
+      }
+
+      const bypassStarted = performance.now();
+      const res = await fetch(upstreamUrl, init);
+      const bypassFetchMs = performance.now() - bypassStarted;
+
+      log('BYPASS', url.pathname, '→', res.status, 'ms=', ms3(bypassFetchMs));
+
+      const runTag =
+        event.request.headers.get('X-Run-Tag') ||
+        url.searchParams.get('runTag') ||
+        '';
+      const iterRaw =
+        event.request.headers.get('X-Req-Seq') ||
+        url.searchParams.get('iter') ||
+        '';
+      const iter = iterRaw === '' ? null : Number(iterRaw);
+
+      if (runTag) {
+        event.waitUntil(postMetric('sw_bypass_fetch', {
+          runTag,
+          iter,
+          bench_kind: event.request.headers.get('X-Bench-Kind') || url.searchParams.get('bench') || '',
+          path: url.pathname,
+          method: event.request.method,
+          http_status: res.status,
+          content_type: res.headers.get('Content-Type') || '',
+          sw_upstream_fetch_ms: ms3(bypassFetchMs),
+          sw_total_ms: ms3(performance.now() - started),
+          resp_header_bytes: Number(res.headers.get('X-Metric-Resp-Header-Bytes') || 0),
+          resp_body_bytes: Number(res.headers.get('X-Metric-Resp-Body-Bytes') || 0),
+          resp_total_bytes: Number(res.headers.get('X-Metric-Resp-Total-Bytes') || 0)
+        }));
+      }
+
+      return res;
+    }
 
     if (!SIG_VERIFY_KEY) {
-      if (url.pathname !== '/' && !BOOTSTRAP_PATHS.has(url.pathname)) {
-        return Response.redirect('/', 302);
-      }
-      return fetch(event.request);
+      const res = await fetch(event.request);
+      log('PASS (no key yet)', url.pathname, '→', res.status);
+      return res;
     }
 
-    let upstreamUrl = buildUpstreamUrl(url);
-    if (runTag) {
-      const u0 = new URL(upstreamUrl);
-      u0.searchParams.set('rt', runTag);
-      upstreamUrl = u0.toString();
-    }
+    const upstreamUrl = APP_ORIGIN + url.pathname + url.search;
 
     const init = {
       method: event.request.method,
       redirect: 'follow',
       credentials: 'omit',
-      cache: 'no-store'
+      headers: new Headers()
     };
 
-    let bodyBytes;
-    let bodyU8;
+    const forwarded = [
+      'Content-Type',
+      'X-Run-Tag',
+      'X-Req-Seq',
+      'X-Bench-Kind'
+    ];
+
+    for (const h of forwarded) {
+      const v = getReqHeader(h, event.request.headers);
+      if (v) init.headers.set(h, v);
+    }
 
     if (event.request.method !== 'GET' && event.request.method !== 'HEAD') {
-      bodyBytes = await event.request.clone().arrayBuffer();
-      bodyU8 = new Uint8Array(bodyBytes);
-      init.body = bodyU8;
-    } else {
-      bodyBytes = new Uint8Array(0).buffer;
-      bodyU8 = new Uint8Array(0);
+      init.body = await event.request.clone().arrayBuffer();
+      if (!init.headers.has('Content-Type')) {
+        init.headers.set(
+          'Content-Type',
+          event.request.headers.get('Content-Type') || 'application/octet-stream'
+        );
+      }
     }
-
-    const headers = new Headers();
-
-    const runTagHdr = event.request.headers.get('X-Run-Tag');
-    if (runTagHdr) headers.set('X-Run-Tag', runTagHdr);
-
-    const contentType = event.request.headers.get('Content-Type');
-    if (contentType && event.request.method !== 'GET' && event.request.method !== 'HEAD') {
-      headers.set('Content-Type', contentType);
-    }
-
-    const u = new URL(upstreamUrl);
-    const targetUri = u.pathname + u.search;
-
-    await signRequestHeaders(event.request.method, targetUri, bodyBytes, headers);
-    init.headers = headers;
 
     let res;
+    const upstreamStarted = performance.now();
     try {
       res = await fetch(upstreamUrl, init);
-    } catch (err) {
-      return new Response('Upstream fetch failed: ' + (err?.message || String(err)), {
-        status: 502,
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-      });
+    } catch (e) {
+      log('NETWORK ERROR', url.pathname, e?.message || String(e));
+      throw e;
     }
+    const upstreamFetchMs = performance.now() - upstreamStarted;
 
     const ct = res.headers.get('Content-Type') || '';
+    if (!isProtectedContentType(ct)) {
+      log('PASS (unverified type)', url.pathname, 'ct=', ct, '→', res.status);
+      return res;
+    }
 
-    if (isUnsigned) return res;
-    if (res.type === 'opaque') return res;
-    if (!isProtectedContentType(ct)) return res;
+    const bodyBytes = await res.clone().arrayBuffer();
 
-    const text = await res.clone().text();
+    try {
+      const method = event.request.method;
+      const targetUri = url.pathname + url.search;
 
-    await verifyResponseWithTimings(res, text, event.request.method, targetUri);
+      const vr = await verifyResponse(res, bodyBytes, method, targetUri);
 
-    const outHeaders = new Headers(res.headers);
-    outHeaders.delete('content-length');
+      log(
+        'OK',
+        url.pathname,
+        'ct=',
+        ct,
+        'status=',
+        res.status,
+        'upstreamMs=',
+        ms3(upstreamFetchMs),
+        'verifyMs=',
+        ms3(vr.totalMs)
+      );
 
-    return new Response(text, {
-      status: res.status,
-      statusText: res.statusText,
-      headers: outHeaders
-    });
+      const runTag =
+        event.request.headers.get('X-Run-Tag') ||
+        url.searchParams.get('runTag') ||
+        '';
+      const iterRaw =
+        event.request.headers.get('X-Req-Seq') ||
+        url.searchParams.get('iter') ||
+        '';
+      const iter = iterRaw === '' ? null : Number(iterRaw);
+
+      if (runTag) {
+        event.waitUntil(postMetric('sw_fetch_verify', {
+          runTag,
+          iter,
+          bench_kind: event.request.headers.get('X-Bench-Kind') || url.searchParams.get('bench') || '',
+          path: url.pathname,
+          method,
+          http_status: res.status,
+          content_type: ct,
+          sw_upstream_fetch_ms: ms3(upstreamFetchMs),
+          sw_digest_verify_ms: ms3(vr.digestMs),
+          sw_signature_verify_ms: ms3(vr.sigMs),
+          sw_verify_ms: ms3(vr.totalMs),
+          sw_total_ms: ms3(performance.now() - started),
+          resp_header_bytes: Number(res.headers.get('X-Metric-Resp-Header-Bytes') || 0),
+          resp_body_bytes: Number(res.headers.get('X-Metric-Resp-Body-Bytes') || bodyBytes.byteLength),
+          resp_total_bytes: Number(res.headers.get('X-Metric-Resp-Total-Bytes') || 0),
+          sign_ms: Number(res.headers.get('X-Metric-Sign-Ms') || 0),
+          req_header_bytes: Number(res.headers.get('X-Metric-Req-Header-Bytes') || 0),
+          req_body_bytes: Number(res.headers.get('X-Metric-Req-Body-Bytes') || 0),
+          decrypt_ms: Number(res.headers.get('X-Metric-Decrypt-Ms') || 0)
+        }));
+      }
+
+      const outHeaders = new Headers(res.headers);
+      outHeaders.delete('content-length');
+
+      return new Response(bodyBytes, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: outHeaders
+      });
+    } catch (e) {
+      log('BLOCK', url.pathname, 'reason=', e.message || String(e), 'ct=', ct, 'status=', res.status);
+
+      return new Response(
+        'Blocked by Service Worker (integrity violation): ' + (e.message || 'unknown'),
+        { status: 498, headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
+      );
+    }
   })());
 });
