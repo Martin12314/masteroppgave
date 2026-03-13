@@ -363,30 +363,22 @@ public class Server {
 
             Map<String, Object> req = OM.readValue(body, Map.class);
 
-            String enc = asString(req.get("enc"));
-            String kid = asString(req.get("kid"));
-            String ciphertextB64 = asString(req.get("ciphertext_b64"));
+            String jweToken = asString(req.get("jwe"));
 
-            if (!"rsa-oaep-256-json".equals(enc)) {
+            if (jweToken == null || jweToken.isBlank()) {
                 ex.setAttribute("handlerResult",
-                        HandlerResult.jsonStatus(400, "{\"ok\":false,\"error\":\"bad_enc\"}"));
+                        HandlerResult.jsonStatus(400, "{\"ok\":false,\"error\":\"missing_jwe\"}"));
                 return;
             }
 
-            if (!JWE_KID.equals(kid)) {
+            DecryptResult dr = jweDecryptTimed(jweToken);
+            if (dr.payload == null) {
                 ex.setAttribute("handlerResult",
-                        HandlerResult.jsonStatus(400, "{\"ok\":false,\"error\":\"bad_kid\"}"));
+                        HandlerResult.jsonStatus(400, "{\"ok\":false,\"error\":\"jwe_decrypt_failed\"}"));
                 return;
             }
 
-            if (ciphertextB64 == null || ciphertextB64.isBlank()) {
-                ex.setAttribute("handlerResult",
-                        HandlerResult.jsonStatus(400, "{\"ok\":false,\"error\":\"missing_ciphertext\"}"));
-                return;
-            }
-
-            byte[] plaintextBytes = rsaOaep256Decrypt(Base64.getDecoder().decode(ciphertextB64), JWE_PRIV);
-            String plaintextJson = new String(plaintextBytes, StandardCharsets.UTF_8);
+            String plaintextJson = dr.payload;
 
             Map<String, Object> env = OM.readValue(plaintextJson, Map.class);
             Map<String, Object> payload = castMap(env.get("payload"));

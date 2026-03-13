@@ -77,6 +77,10 @@ function toB64(bytes) {
   return btoa(s);
 }
 
+function toB64Url(bytes) {
+  return toB64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
 function b64ToBytes(b64) {
   const bin = atob(b64);
   return Uint8Array.from(bin, c => c.charCodeAt(0));
@@ -231,30 +235,47 @@ async function registerClientKey(jweJwk) {
   );
   const proofSigB64 = toB64(new Uint8Array(proofSig));
 
-  const jweKey = await crypto.subtle.importKey(
+  // Hybrid JWE: RSA-OAEP-256 wraps a random AES-256-GCM key; AES-256-GCM encrypts the envelope.
+  // Direct RSA-OAEP encryption of the full envelope would exceed the ~190-byte plaintext limit
+  // for a 2048-bit key and cause the crypto operation to hang or throw in all browsers.
+
+  const wrappingKey = await crypto.subtle.importKey(
     'jwk',
-    { kty: 'RSA', n: jweJwk.n, e: jweJwk.e, alg: 'RSA-OAEP-256', ext: true, key_ops: ['encrypt'] },
+    { kty: 'RSA', n: jweJwk.n, e: jweJwk.e },
     { name: 'RSA-OAEP', hash: 'SHA-256' },
     false,
     ['encrypt']
   );
 
+  const cek = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt']);
+  const cekRaw = await crypto.subtle.exportKey('raw', cek);
+  const encryptedKey = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, wrappingKey, cekRaw);
+
+  const header = { alg: 'RSA-OAEP-256', enc: 'A256GCM', kid: jweJwk.kid };
+  const headerB64 = toB64Url(new TextEncoder().encode(JSON.stringify(header)));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+
   const envelope = JSON.stringify({ payload, proof_sig_b64: proofSigB64 });
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: 'RSA-OAEP' },
-    jweKey,
+  const encrypted = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(headerB64), tagLength: 128 },
+    cek,
     new TextEncoder().encode(envelope)
   );
-  const ciphertextB64 = toB64(new Uint8Array(ciphertext));
+
+  // Web Crypto AES-GCM returns ciphertext || tag (tag = last 16 bytes)
+  const encArr = new Uint8Array(encrypted);
+  const jweCompact = [
+    headerB64,
+    toB64Url(new Uint8Array(encryptedKey)),
+    toB64Url(iv),
+    toB64Url(encArr.slice(0, encArr.length - 16)),
+    toB64Url(encArr.slice(encArr.length - 16))
+  ].join('.');
 
   const res = await fetch(APP_ORIGIN + '/req-key/register', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      enc: 'rsa-oaep-256-json',
-      kid: jweJwk.kid,
-      ciphertext_b64: ciphertextB64
-    })
+    body: JSON.stringify({ jwe: jweCompact })
   });
 
   if (!res.ok) {
