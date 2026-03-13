@@ -4,6 +4,7 @@ import com.sun.net.httpserver.*;
 import org.jose4j.jwe.ContentEncryptionAlgorithmIdentifiers;
 import org.jose4j.jwe.JsonWebEncryption;
 import org.jose4j.jwe.KeyManagementAlgorithmIdentifiers;
+import org.jose4j.jwk.JsonWebKey;
 import org.jose4j.jwk.RsaJsonWebKey;
 import org.jose4j.jwk.RsaJwkGenerator;
 import org.jose4j.lang.JoseException;
@@ -22,14 +23,16 @@ import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import org.jose4j.jwk.JsonWebKey;
+
 public class Server {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final Path METRICS_DIR = Paths.get("metrics");
     private static final Path METRICS_FILE = METRICS_DIR.resolve("metrics.ndjson");
+    private static final Map<String, RSAPublicKey> CLIENT_REQ_PUBS = new ConcurrentHashMap<>();
 
     private static RSAPublicKey JWE_PUB;
     private static RSAPrivateKey JWE_PRIV;
@@ -65,6 +68,7 @@ public class Server {
         contexts.add(http.createContext("/metrics", Server::handleMetrics));
         contexts.add(http.createContext("/api/login", Server::handleLogin));
         contexts.add(http.createContext("/api/login_plain", Server::handleLoginPlain));
+        contexts.add(http.createContext("/req-key/register", Server::handleReqKeyRegister));
 
         HttpContext ctxEcho = http.createContext("/api/echo", Server::handleEcho);
         HttpContext secured1 = http.createContext("/secured/index.html", Server::handleFile);
@@ -151,6 +155,100 @@ public class Server {
         }
     }
 
+    private static void handleReqKeyRegister(HttpExchange ex) {
+        try {
+            ex.setAttribute("disableSigning", Boolean.TRUE);
+
+            if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.setAttribute("handlerResult", HandlerResult.text(405, "Method Not Allowed"));
+                return;
+            }
+
+            String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            Map<String, Object> req = tryParseJsonMap(body);
+
+            String compactJwe = String.valueOf(req.get("jwe"));
+            if (compactJwe == null || compactJwe.isBlank() || "null".equals(compactJwe)) {
+                ex.setAttribute("handlerResult", HandlerResult.text(400, "Missing jwe"));
+                return;
+            }
+
+            String payload = jweDecrypt(compactJwe);
+            if (payload == null) {
+                ex.setAttribute("handlerResult", HandlerResult.text(400, "JWE decrypt failed"));
+                return;
+            }
+
+            Map<String, Object> reg = tryParseJsonMap(payload);
+            String kid = String.valueOf(reg.get("kid"));
+            Object jwkObj = reg.get("jwk");
+
+            if (kid == null || kid.isBlank() || jwkObj == null) {
+                ex.setAttribute("handlerResult", HandlerResult.text(400, "Missing kid/jwk"));
+                return;
+            }
+
+            String jwkJson = MAPPER.writeValueAsString(jwkObj);
+            RsaJsonWebKey clientJwk = (RsaJsonWebKey) JsonWebKey.Factory.newJwk(jwkJson);
+            RSAPublicKey clientPub = (RSAPublicKey) clientJwk.getPublicKey();
+
+            CLIENT_REQ_PUBS.put(kid, clientPub);
+
+            ex.setAttribute("handlerResult", HandlerResult.json("{\"ok\":true,\"kid\":\"" + json(kid) + "\"}"));
+        } catch (Exception e) {
+            ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
+        }
+    }
+
+    private static boolean verifyClientSignedRequest(HttpExchange ex, byte[] bodyBytes) {
+        try {
+            String kid = headerFirst(ex, "X-client-key-id");
+            String created = headerFirst(ex, "X-req-created");
+            String cd = headerFirst(ex, "X-req-content-digest");
+            String sigB64 = headerFirst(ex, "X-req-signature");
+
+            if (kid == null || created == null || cd == null || sigB64 == null) {
+                return false;
+            }
+
+            RSAPublicKey pub = CLIENT_REQ_PUBS.get(kid);
+            if (pub == null) {
+                return false;
+            }
+
+            String expectedCd = "sha-256=:" + Base64.getEncoder().encodeToString(sha256(bodyBytes)) + ":";
+            if (!expectedCd.equals(cd)) {
+                return false;
+            }
+
+            String method = ex.getRequestMethod().toLowerCase(Locale.ROOT);
+            String target = ex.getRequestURI().toString();
+
+            String base =
+                    "\"@method\": \"" + method + "\"\n" +
+                            "\"@target-uri\": \"" + target + "\"\n" +
+                            "\"x-req-created\": " + created + "\n" +
+                            "\"x-req-content-digest\": " + cd + "\n" +
+                            "\"x-client-key-id\": " + kid;
+
+            Signature s = Signature.getInstance("RSASSA-PSS");
+            s.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
+            s.initVerify(pub);
+            s.update(base.getBytes(StandardCharsets.UTF_8));
+            return s.verify(Base64.getDecoder().decode(sigB64));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static double verifyClientSignedRequestTimed(HttpExchange ex, byte[] bodyBytes) {
+        long t0 = System.nanoTime();
+        boolean ok = verifyClientSignedRequest(ex, bodyBytes);
+        double ms = (System.nanoTime() - t0) / 1_000_000.0;
+        ex.getResponseHeaders().set("X-Metric-Req-Verify-Ms", formatMs(ms));
+        return ok ? ms : -1.0;
+    }
+
     private static void handleMetrics(HttpExchange ex) {
         try {
             if ("OPTIONS".equalsIgnoreCase(ex.getRequestMethod())) {
@@ -217,7 +315,15 @@ public class Server {
                 return;
             }
 
-            String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            byte[] bodyBytes = ex.getRequestBody().readAllBytes();
+            String body = new String(bodyBytes, StandardCharsets.UTF_8);
+
+            double verifyMs = verifyClientSignedRequestTimed(ex, bodyBytes);
+            if (verifyMs < 0) {
+                ex.setAttribute("handlerResult", HandlerResult.text(401, "Bad client request signature"));
+                return;
+            }
+
             String usernameEnc = jsonField(body, "username");
             String passwordEnc = jsonField(body, "password");
 
@@ -242,10 +348,12 @@ public class Server {
             }
 
             int reqHeaderBytes = approximateRequestHeaderBytes(ex);
-            int reqBodyBytes = utf8Bytes(body);
+            int reqBodyBytes = bodyBytes.length;
+            int reqSignHeaderBytes = approximateRequestSigningHeaderBytes(ex);
 
             ex.getResponseHeaders().set("X-Metric-Req-Header-Bytes", String.valueOf(reqHeaderBytes));
             ex.getResponseHeaders().set("X-Metric-Req-Body-Bytes", String.valueOf(reqBodyBytes));
+            ex.getResponseHeaders().set("X-Metric-Req-Sign-Header-Bytes", String.valueOf(reqSignHeaderBytes));
             ex.getResponseHeaders().set("X-Metric-Decrypt-Ms", formatMs(decryptMs));
 
             ex.setAttribute("handlerResult", hr);
@@ -256,7 +364,14 @@ public class Server {
 
     private static void handleEcho(HttpExchange ex) {
         try {
-            String rawBody = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            byte[] rawBytes = ex.getRequestBody().readAllBytes();
+            String rawBody = new String(rawBytes, StandardCharsets.UTF_8);
+
+            double verifyMs = verifyClientSignedRequestTimed(ex, rawBytes);
+            if (verifyMs < 0) {
+                ex.setAttribute("handlerResult", HandlerResult.text(401, "Bad client request signature"));
+                return;
+            }
 
             Map<String, Object> resp = new LinkedHashMap<>();
 
@@ -293,7 +408,6 @@ public class Server {
             if (parsedBody instanceof Map) {
                 @SuppressWarnings("unchecked")
                 Map<String, Object> bodyMap = (Map<String, Object>) parsedBody;
-
                 decryptIfJweString(bodyMap, "name", decrypted, notes);
                 decryptIfJweString(bodyMap, "message", decrypted, notes);
                 decryptIfJweString(bodyMap, "username", decrypted, notes);
@@ -629,7 +743,8 @@ public class Server {
                 "Content-type", "Content-length",
                 "X-custom", "X-Enc-X-Custom",
                 "Tailscale-user-name", "Tailscale-user-login",
-                "X-Run-Tag", "X-Req-Seq", "X-Bench-Kind"
+                "X-Run-Tag", "X-Req-Seq", "X-Bench-Kind",
+                "X-Client-Key-Id", "X-Req-Created", "X-Req-Content-Digest", "X-Req-Signature"
         };
         for (String k : keys) {
             String v = headerFirst(ex, k);
@@ -674,6 +789,26 @@ public class Server {
         return total;
     }
 
+    private static int approximateRequestSigningHeaderBytes(HttpExchange ex) {
+        String[] keys = new String[] {
+                "X-client-key-id",
+                "X-req-created",
+                "X-req-content-digest",
+                "X-req-signature"
+        };
+
+        int total = 0;
+        for (String k : keys) {
+            List<String> vals = ex.getRequestHeaders().get(k);
+            if (vals == null) continue;
+            for (String v : vals) {
+                total += utf8Bytes(k) + 2 + utf8Bytes(v) + 1;
+            }
+        }
+        total += 1;
+        return total;
+    }
+
     private static int approximateResponseHeaderBytes(Headers h, int bodyLen, boolean signed) {
         int total = 0;
         for (Map.Entry<String, List<String>> e : h.entrySet()) {
@@ -692,7 +827,7 @@ public class Server {
     }
 
     private static String formatMs(double ms) {
-        return String.format(Locale.US, "%.2f", ms);
+        return String.format(Locale.US, "%.3f", ms);
     }
 
     private static synchronized void appendNdjson(String line) throws IOException {

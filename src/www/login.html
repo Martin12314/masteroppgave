@@ -77,7 +77,7 @@
 <h3>Security + app log</h3>
 <pre id="security-log" class="logbox">Waiting for Service Worker…</pre>
 
-<iframe id="benchFrame" class="benchframe" sandbox="allow-scripts allow-same-origin"></iframe>
+<iframe id="benchFrame" class="benchframe"></iframe>
 
 <script type="module">
     import { CompactEncrypt, importJWK } from 'https://cdn.jsdelivr.net/npm/jose@5.3.0/+esm';
@@ -157,15 +157,130 @@
     }
 
     let jweKey = null;
+    let hostJweJwk = null;
     let kid = null;
     let kxOK = false;
+    let reqSignOK = false;
 
     function refreshButtons() {
-      const protectedEnabled = (kxOK || allowUnsafe.checked);
+      const protectedEnabled = ((kxOK && reqSignOK) || allowUnsafe.checked);
       loginBtn.disabled = !protectedEnabled;
       benchBtn.disabled = !protectedEnabled;
       bigProtectedBtn.disabled = !protectedEnabled;
       bigBaselineBtn.disabled = false;
+    }
+
+    allowUnsafe.addEventListener('change', refreshButtons);
+
+    async function swActive() {
+      const reg = await navigator.serviceWorker.ready;
+      return navigator.serviceWorker.controller || reg.active || reg.waiting || reg.installing;
+    }
+
+    function waitForSWMessage(types, timeoutMs = 6000) {
+      const wanted = new Set(Array.isArray(types) ? types : [types]);
+
+      return new Promise((resolve, reject) => {
+        const t = setTimeout(() => {
+          navigator.serviceWorker.removeEventListener('message', onMsg);
+          reject(new Error('Timed out waiting for SW message: ' + Array.from(wanted).join(',')));
+        }, timeoutMs);
+
+        function onMsg(ev) {
+          const type = ev?.data?.type;
+          if (!wanted.has(type)) return;
+          clearTimeout(t);
+          navigator.serviceWorker.removeEventListener('message', onMsg);
+          resolve(ev.data);
+        }
+
+        navigator.serviceWorker.addEventListener('message', onMsg);
+      });
+    }
+
+    async function initRequestSigning() {
+      if (!hostJweJwk || !jweKey) {
+        throw new Error('Host JWE key missing for request-sign registration');
+      }
+
+      const bootstrapStarted = performance.now();
+
+      const active = await swActive();
+      if (!active) throw new Error('No active Service Worker instance');
+
+      pageLog('Requesting per-SW request-sign keypair from Service Worker');
+      const pubPromise = waitForSWMessage(['REQ_SIGN_PUBLIC_KEY', 'REQ_SIGN_ERROR'], 8000);
+      active.postMessage({ type: 'INIT_REQ_SIGNING' });
+      const pubMsg = await pubPromise;
+
+      if (pubMsg.type === 'REQ_SIGN_ERROR') {
+        throw new Error(pubMsg.message || 'SW failed generating request-sign key');
+      }
+
+      const clientKid = pubMsg.kid;
+      const clientPubJwk = pubMsg.jwk;
+      const swReqKeygenMs = Number(pubMsg.sw_req_keygen_ms || 0);
+      const swReqKeyExportMs = Number(pubMsg.sw_req_key_export_ms || 0);
+      const swReqKeyTotalMs = Number(pubMsg.sw_req_key_total_ms || 0);
+
+      pageLog('SW generated request-sign public key kid=', clientKid);
+
+      const regPayload = JSON.stringify({
+        kid: clientKid,
+        jwk: clientPubJwk
+      });
+
+      pageLog('Encrypting client request public key with host JWE public key');
+      const regEncStarted = performance.now();
+      const enc = new CompactEncrypt(new TextEncoder().encode(regPayload));
+      enc.setProtectedHeader({ alg:'RSA-OAEP-256', enc:'A256GCM', kid });
+      const regJwe = await enc.encrypt(jweKey);
+      const reqKeyRegisterJweEncryptMs = performance.now() - regEncStarted;
+
+      pageLog('Posting encrypted request public key to app /req-key/register');
+      const regFetchStarted = performance.now();
+      const rr = await fetch(APP_ORIGIN + '/req-key/register', {
+        method: 'POST',
+        mode: 'cors',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kid: clientKid, jwe: regJwe })
+      });
+      const reqKeyRegisterFetchMs = performance.now() - regFetchStarted;
+
+      if (!rr.ok) throw new Error('Request-key register failed HTTP ' + rr.status);
+
+      const txt = await rr.text();
+      pageLog('req-key/register HTTP', rr.status, 'body=', txt);
+
+      let j = null;
+      try { j = JSON.parse(txt); } catch {}
+      if (!j?.ok) throw new Error('Request-key registration was not accepted');
+
+      const regAck = waitForSWMessage(['REQ_SIGNING_READY', 'REQ_SIGN_ERROR'], 4000);
+      active.postMessage({ type: 'REQ_SIGNING_REGISTERED', kid: clientKid });
+      const ack = await regAck;
+
+      if (ack.type === 'REQ_SIGN_ERROR') {
+        throw new Error(ack.message || 'SW failed marking request-sign key ready');
+      }
+
+      reqSignOK = true;
+      pageLog('Request-sign key registered and SW ready (kid=' + clientKid + ')');
+
+      const reqSignBootstrapTotalMs = performance.now() - bootstrapStarted;
+
+      await postMetric('req_sign_bootstrap', {
+        kid: clientKid,
+        sw_req_keygen_ms: ms3(swReqKeygenMs),
+        sw_req_key_export_ms: ms3(swReqKeyExportMs),
+        sw_req_key_total_ms: ms3(swReqKeyTotalMs),
+        req_key_register_payload_bytes: utf8Bytes(regPayload),
+        req_key_register_jwe_bytes: utf8Bytes(regJwe),
+        req_key_register_jwe_encrypt_ms: ms3(reqKeyRegisterJweEncryptMs),
+        req_key_register_fetch_ms: ms3(reqKeyRegisterFetchMs),
+        req_sign_bootstrap_total_ms: ms3(reqSignBootstrapTotalMs)
+      });
     }
 
     async function initKey(){
@@ -175,13 +290,13 @@
         pageLog('tamper=', tamper || 'none', 'fetch=', '/key-exchange' + q);
 
         const r = await fetch('/key-exchange' + q, { cache:'no-store' });
-
         pageLog('key-exchange HTTP', r.status, r.statusText);
         if (!r.ok) throw new Error('HTTP ' + r.status);
 
         const jwk = await r.json();
+        hostJweJwk = jwk;
         kid = jwk.kid || '(no-kid)';
-        pageLog('Received JWK kid=', kid);
+        pageLog('Received JWE host key kid=', kid);
 
         jweKey = await importJWK(
           { kty:'RSA', n:jwk.n, e:jwk.e, alg:'RSA-OAEP-256' },
@@ -190,18 +305,19 @@
 
         kxOK = true;
         setKx(true, 'Key exchange OK (JWE key imported)');
-        pageLog('JWE public key imported');
+        pageLog('Host JWE public key imported');
+
+        await initRequestSigning();
       } catch (e) {
         kxOK = false;
-        setKx(false, 'Key exchange failed: ' + (e.message || e));
-        pageLog('Key exchange failed:', e.message || String(e));
+        reqSignOK = false;
+        setKx(false, 'Key exchange / req-sign init failed: ' + (e.message || e));
+        pageLog('Init failed:', e.message || String(e));
         console.error(e);
       } finally {
         refreshButtons();
       }
     }
-
-    allowUnsafe.addEventListener('change', refreshButtons);
 
     async function enc(plaintext){
       const ce = new CompactEncrypt(new TextEncoder().encode(plaintext));
@@ -210,8 +326,8 @@
     }
 
     async function doProtectedOnce({ runTag = '', iter = '' } = {}){
-      if (!(kxOK || allowUnsafe.checked)) {
-        throw new Error('Key exchange not OK. Check logs.');
+      if (!(kxOK && reqSignOK) && !allowUnsafe.checked) {
+        throw new Error('Key exchange / request-sign bootstrap not OK. Check logs.');
       }
       if (!jweKey) {
         throw new Error('JWE key missing. Check logs.');
@@ -274,7 +390,9 @@
         login_resp_body_bytes: utf8Bytes(txt),
         host_req_header_bytes: Number(r.headers.get('X-Metric-Req-Header-Bytes') || 0),
         host_req_body_bytes: Number(r.headers.get('X-Metric-Req-Body-Bytes') || 0),
-        host_decrypt_ms: Number(r.headers.get('X-Metric-Decrypt-Ms') || 0)
+        host_req_sign_header_bytes: Number(r.headers.get('X-Metric-Req-Sign-Header-Bytes') || 0),
+        host_decrypt_ms: Number(r.headers.get('X-Metric-Decrypt-Ms') || 0),
+        host_req_verify_ms: Number(r.headers.get('X-Metric-Req-Verify-Ms') || 0)
       });
 
       return { ok: !!j?.ok, status: r.status };
@@ -287,7 +405,7 @@
         location.href = '/index.html';
       } else {
         pageLog('Login failed (ok=false)');
-        alert('Login failed (wrong creds or decrypt blocked). See log.');
+        alert('Login failed. See log.');
       }
     }
 
@@ -335,11 +453,8 @@
           clearTimeout(timeout);
           window.removeEventListener('message', onMessage);
 
-          if (ev.data?.error) {
-            reject(new Error(ev.data.error));
-          } else {
-            resolve(true);
-          }
+          if (ev.data?.error) reject(new Error(ev.data.error));
+          else resolve(true);
         }
 
         window.addEventListener('message', onMessage);
@@ -381,7 +496,6 @@
             err: e?.message || String(e)
           });
         }
-
         await new Promise(r => setTimeout(r, 100));
       }
 
