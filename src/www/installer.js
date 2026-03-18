@@ -1,140 +1,276 @@
-// Trusted installer: bootstraps trust using DNS TXT pinning
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>JWE Field Encrypt (Lab)</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <link rel="stylesheet" href="/styles.css">
+    <style>
+        .status { padding:.5rem .75rem; border-radius:.5rem; display:inline-block; margin:.25rem 0 }
+        .ok { background:#e8f7ee; color:#146c2e; border:1px solid #bfe7cc }
+        .fail { background:#ffecec; color:#8a1f11; border:1px solid #f5c0bc }
+        fieldset { margin:1rem 0 }
+        label { display:block; margin:.35rem 0 }
+        input, textarea { width:100%; padding:.5rem; box-sizing:border-box }
+        pre { white-space:pre-wrap; word-break:break-word }
 
-const out = document.getElementById('log');
+        .logbox {
+          background:#0b1020;
+          color:#d0d7ff;
+          padding:1rem;
+          border-radius:.5rem;
+          max-height:260px;
+          overflow:auto;
+          font-size:.85rem;
+        }
+        .row { display:flex; gap:.75rem; align-items:center; flex-wrap:wrap }
+        .small { font-size:.9rem; color:#555 }
+        code { background:#f6f8fa; padding:0 .25rem; border-radius:.25rem; }
+    </style>
+</head>
+<body>
 
-function log(m) {
-  console.log('[INSTALL]', m);
-  out.textContent += '\n' + m;
-  out.scrollTop = out.scrollHeight;
-}
+<h1>Pick fields/headers to encrypt (JWE)</h1>
 
-const APP_ORIGIN = 'https://app.masteroppgave2026.no';
+<div id="kxStatus" class="status">Key exchange not run yet…</div>
 
-// -------------------- DNS pin lookup --------------------
+<p class="small">
+    Tamper demo:
+    <a href="/index.html">normal</a> ·
+    <a href="/index.html?tamper=signature">signature</a> ·
+    <a href="/index.html?tamper=digest">digest</a> ·
+    <a href="/index.html?tamper=body">body</a> ·
+    <a href="/index.html?tamper=all">all</a>
+</p>
 
-async function fetchDNSPin() {
-  console.log('[INSTALL] VERSION = 2026-01-29');
-  log('[INSTALL] VERSION = 2026-01-29');
+<fieldset>
+    <legend>Body</legend>
+    <label>Name <input id="name" placeholder="alice"></label>
+    <label>Age <input id="age" type="number" value="30"></label>
+    <label>Message <textarea id="msg" rows="3" placeholder="hello"></textarea></label>
+    <label><input type="checkbox" id="encName" checked> Encrypt name</label>
+    <label><input type="checkbox" id="encMsg" checked> Encrypt message</label>
+</fieldset>
 
-  log('Fetching SIG-PUB pin from DNS TXT (_sigpub.app.masteroppgave2026.no)…');
+<fieldset>
+    <legend>Headers</legend>
+    <label>X-Custom <input id="xhdr" placeholder="secret-header"></label>
+    <label><input type="checkbox" id="encHdr"> Encrypt X-Custom header</label>
+</fieldset>
 
-  const r = await fetch(
-    'https://cloudflare-dns.com/dns-query?name=_sigpub.app.masteroppgave2026.no&type=TXT',
-    {
-      headers: { accept: 'application/dns-json' },
-      cache: 'no-store'
+<div class="row">
+    <button id="sendBtn" disabled>Send</button>
+    <label class="small"><input type="checkbox" id="verbose"> verbose logs (show full JWE strings)</label>
+</div>
+
+<h3>Security + app log</h3>
+<pre id="security-log" class="logbox">Waiting for Service Worker…</pre>
+
+<h2>Response from Host</h2>
+<pre id="out"></pre>
+
+<script type="module">
+    import { CompactEncrypt, importJWK } from 'https://cdn.jsdelivr.net/npm/jose@5.3.0/+esm';
+
+    const secLog = document.getElementById('security-log');
+    const verbose = document.getElementById('verbose');
+    const sendBtn = document.getElementById('sendBtn');
+
+    function appendLog(line) {
+      secLog.textContent += line + '\n';
+      secLog.scrollTop = secLog.scrollHeight;
     }
-  );
 
-  const j = await r.json();
-  const raw = j.Answer?.[0]?.data?.replace(/"/g, '');
-
-  if (!raw) throw new Error('DNS pin missing');
-
-  const parts = Object.fromEntries(
-    raw.split(';').map(p => p.split('=', 2))
-  );
-
-  if (parts.v !== '1') throw new Error('Unsupported DNS pin version');
-  if (!parts.kid || !parts.sha256) throw new Error('DNS pin missing kid or sha256');
-
-  log(`DNS pin loaded (kid=${parts.kid})`);
-  return { kid: parts.kid, sha256: parts.sha256 };
-}
-
-// -------------------- Hash helper --------------------
-
-async function hashJWK(jwk) {
-  const canonical = JSON.stringify({ kty: jwk.kty, n: jwk.n, e: jwk.e });
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
-  return btoa(String.fromCharCode(...new Uint8Array(buf)));
-}
-
-function normalizeB64(s) {
-  return s.replace(/=+$/, '');
-}
-
-// Wait until SW confirms it imported the key
-function waitForSWKeyAck(expectedKid, timeoutMs = 4000) {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => {
-      navigator.serviceWorker.removeEventListener('message', onMsg);
-      reject(new Error('Timed out waiting for SW key install ack'));
-    }, timeoutMs);
-
-    function onMsg(ev) {
-      if (ev?.data?.type === 'SIG_KEY_INSTALLED' && ev.data.kid === expectedKid) {
-        clearTimeout(t);
-        navigator.serviceWorker.removeEventListener('message', onMsg);
-        resolve(true);
-      }
-      if (ev?.data?.type === 'SIG_KEY_ERROR') {
-        clearTimeout(t);
-        navigator.serviceWorker.removeEventListener('message', onMsg);
-        reject(new Error('SW failed to install key: ' + (ev.data.message || 'unknown')));
-      }
+    function nowTs() {
+      return new Date().toISOString();
     }
 
-    navigator.serviceWorker.addEventListener('message', onMsg);
-  });
-}
+    function pageLog(...args) {
+      appendLog(`[${nowTs()}] [PAGE] ${args.join(' ')}`);
+    }
 
-// -------------------- Main installer flow --------------------
+    navigator.serviceWorker?.addEventListener('message', e => {
+      if (e.data?.type === 'SW_LOG') {
+        appendLog(`[${e.data.ts}] [SW] ${e.data.message}`);
+      }
+    });
 
-async function main() {
-  log('Installer started');
+    window.addEventListener('error', (e) => {
+      pageLog('ERROR', e.message);
+    });
 
-  // 1) DNS pin
-  const pinned = await fetchDNSPin();
+    const kxStatus = document.getElementById('kxStatus');
+    function badge(ok, text) {
+      kxStatus.textContent = text;
+      kxStatus.className = 'status ' + (ok ? 'ok' : 'fail');
+    }
 
-  // 2) Fetch signature public key from app origin (requires strict CORS on app.*)
-  log('Fetching /sig-pub from app origin…');
-  const r = await fetch(APP_ORIGIN + '/sig-pub', {
-    cache: 'no-store',
-    mode: 'cors'
-  });
+    let jweKey = null;
+    let kid = null;
+    let reqSignOK = false;
 
-  if (!r.ok) throw new Error('Failed to fetch /sig-pub (HTTP ' + r.status + ')');
+    async function swActive() {
+      const reg = await navigator.serviceWorker.ready;
+      return navigator.serviceWorker.controller || reg.active || reg.waiting || reg.installing;
+    }
 
-  const jwk = await r.json();
-  log(`Got SIG-PUB (kid=${jwk.kid})`);
+    function waitForSWMessage(types, timeoutMs = 6000) {
+      const wanted = new Set(Array.isArray(types) ? types : [types]);
 
-  const now = Math.floor(Date.now() / 1000);
-  if (jwk.created > now + 60) throw new Error('SIG-PUB created in the future');
-  if (jwk.expires < now) throw new Error('SIG-PUB expired');
-  if (jwk.kid !== pinned.kid) throw new Error(`KID mismatch: DNS=${pinned.kid}, SIG-PUB=${jwk.kid}`);
+      return new Promise((resolve, reject) => {
+        const t = setTimeout(() => {
+          navigator.serviceWorker.removeEventListener('message', onMsg);
+          reject(new Error('Timed out waiting for SW message: ' + Array.from(wanted).join(',')));
+        }, timeoutMs);
 
-  // 3) Verify key material
-  const localHash = await hashJWK(jwk);
-  if (normalizeB64(localHash) !== normalizeB64(pinned.sha256)) {
-    throw new Error('MITM detected: SIG-PUB hash mismatch');
-  }
-  log('SIG-PUB verified against DNS pin');
+        function onMsg(ev) {
+          const type = ev?.data?.type;
+          if (!wanted.has(type)) return;
+          clearTimeout(t);
+          navigator.serviceWorker.removeEventListener('message', onMsg);
+          resolve(ev.data);
+        }
 
-  // 4) Register Service Worker
-  if (!('serviceWorker' in navigator)) throw new Error('ServiceWorker not supported');
+        navigator.serviceWorker.addEventListener('message', onMsg);
+      });
+    }
 
-  log('Registering Service Worker /sw.js …');
-  const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
-  await navigator.serviceWorker.ready;
-  log('Service Worker ready');
+    async function getReqSignStatus() {
+      const active = await swActive();
+      if (!active) throw new Error('No active Service Worker instance');
 
-  const active = reg.active || reg.waiting || reg.installing;
-  if (!active) throw new Error('No active Service Worker instance');
+      const p = waitForSWMessage('REQ_SIGN_STATUS', 4000);
+      active.postMessage({ type: 'GET_REQ_SIGN_STATUS' });
+      return await p;
+    }
 
-  // 5) Deliver verified key to SW + wait for ack
-  log('Sending verified key to Service Worker');
-  const ackPromise = waitForSWKeyAck(jwk.kid, 4000);
-  active.postMessage({ type: 'SET_SIG_KEY', jwk });
-  await ackPromise;
-  log('Service Worker confirmed key installed');
+    async function initKey() {
+      pageLog('Fetching JWE public key from /key-exchange (expect SW to verify)');
+      const tamper = new URLSearchParams(location.search).get('tamper');
+      const q = tamper ? `?tamper=${encodeURIComponent(tamper)}` : '';
+      pageLog('tamper=', tamper || 'none', 'fetch=', '/key-exchange' + q);
 
-  // 6) Enter protected application (same apex URL; SW will fetch verified bytes from app.*)
-  log('Redirecting to /login.html …');
-  location.replace('/login.html');
-}
+      const r = await fetch('/key-exchange' + q, { cache:'no-store' });
 
-main().catch(err => {
-  log('FATAL: ' + (err?.message || err));
-  console.error(err);
-});
+      pageLog('key-exchange HTTP', r.status, r.statusText);
+      if (!r.ok) {
+        badge(false, 'Key exchange failed: HTTP ' + r.status);
+        throw new Error('key-exchange failed: ' + r.status);
+      }
+
+      const jwk = await r.json();
+      kid = jwk.kid || '(no-kid)';
+      pageLog('Received JWK kid=', kid);
+
+      jweKey = await importJWK(
+        { kty:'RSA', n:jwk.n, e:jwk.e, alg:'RSA-OAEP-256' },
+        'RSA-OAEP-256'
+      );
+
+      const rs = await getReqSignStatus();
+      reqSignOK = !!rs.ready;
+      pageLog('Request-sign status from SW: ready=', String(reqSignOK), 'kid=', rs.kid || '(none)');
+
+      if (!reqSignOK) {
+        badge(false, 'Request-signing not ready in Service Worker');
+        sendBtn.disabled = true;
+        return;
+      }
+
+      badge(true, 'Key exchange OK (JWE key imported)');
+      sendBtn.disabled = false;
+      pageLog('JWE public key imported');
+    }
+
+    async function enc(plaintext) {
+      const e = new CompactEncrypt(new TextEncoder().encode(plaintext));
+      e.setProtectedHeader({ alg:'RSA-OAEP-256', enc:'A256GCM', kid });
+      return await e.encrypt(jweKey);
+    }
+
+    function maybeShort(s) {
+      if (verbose.checked) return s;
+      if (!s) return s;
+      if (s.length <= 80) return s;
+      return s.slice(0, 40) + ' … ' + s.slice(-28) + ` (len=${s.length})`;
+    }
+
+    initKey().catch(err => {
+      badge(false, 'Key exchange error: ' + err.message);
+      pageLog('Key exchange error:', err.message);
+      console.error(err);
+    });
+
+    document.getElementById('sendBtn').addEventListener('click', async () => {
+      if (!jweKey) {
+        pageLog('Cannot send: JWE key not ready yet');
+        alert('Key not ready yet. Check log.');
+        return;
+      }
+      if (!reqSignOK) {
+        pageLog('Cannot send: request-signing not ready yet');
+        alert('Request-signing not ready yet. Check log.');
+        return;
+      }
+
+      const name = document.getElementById('name').value || '';
+      const age  = Number(document.getElementById('age').value || 0);
+      const msg  = document.getElementById('msg').value || '';
+
+      const encName = document.getElementById('encName').checked;
+      const encMsg  = document.getElementById('encMsg').checked;
+
+      const xhdrVal = document.getElementById('xhdr').value || '';
+      const encHdr  = document.getElementById('encHdr').checked;
+
+      pageLog('Preparing request → /api/echo');
+      pageLog('Selections:',
+        `encName=${encName}`,
+        `encMsg=${encMsg}`,
+        `xhdr=${xhdrVal ? 'set' : 'empty'}`,
+        `encHdr=${encHdr}`
+      );
+
+      const body = {
+        name: encName ? ("JWE: " + await enc(name)) : name,
+        age,
+        message: encMsg ? ("JWE: " + await enc(msg)) : msg
+      };
+
+      const headers = { 'Content-Type': 'application/json' };
+      if (xhdrVal) {
+        if (encHdr) headers['X-Enc-X-Custom'] = await enc(xhdrVal);
+        else headers['X-Custom'] = xhdrVal;
+      }
+
+      pageLog('Request body preview:',
+        `name=${encName ? 'JWE ' + maybeShort(body.name) : JSON.stringify(body.name)}`,
+        `age=${body.age}`,
+        `message=${encMsg ? 'JWE ' + maybeShort(body.message) : JSON.stringify(body.message)}`
+      );
+      if (headers['X-Custom']) pageLog('Header X-Custom:', JSON.stringify(headers['X-Custom']));
+      if (headers['X-Enc-X-Custom']) pageLog('Header X-Enc-X-Custom:', 'JWE ' + maybeShort(headers['X-Enc-X-Custom']));
+
+      pageLog('Sending…');
+      const t0 = performance.now();
+
+      let r;
+      try {
+        r = await fetch('/api/echo', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body)
+        });
+      } catch (e) {
+        pageLog('NETWORK ERROR sending /api/echo:', e.message);
+        throw e;
+      }
+
+      pageLog('Response HTTP', r.status, r.statusText, `(${Math.round(performance.now()-t0)}ms)`);
+      const text = await r.text();
+      document.getElementById('out').textContent = text;
+    });
+</script>
+
+</body>
+</html>

@@ -1,11 +1,15 @@
 // sw.js — Service Worker for apex origin
-// Response verification + request signing prototype + measurements
+// Response verification + protected-flow bootstrap + request signing + measurements
 
 let SIG_VERIFY_KEY = null;
 
 let REQ_SIGN_KEYPAIR = null;
 let REQ_SIGN_KID = null;
 let REQ_SIGN_READY = false;
+
+let HOST_JWE_JWK = null;
+let HOST_JWE_KID = null;
+let PROTECTED_FLOW_BOOTSTRAP_PROMISE = null;
 
 const APP_ORIGIN = 'https://app.masteroppgave2026.no';
 const METRICS_URL = APP_ORIGIN + '/metrics';
@@ -42,12 +46,15 @@ function shouldBypassSecurity(url) {
   );
 }
 
+// Only sign the protected main flow
 function shouldSignRequest(url, method) {
   method = String(method || 'GET').toUpperCase();
   if (method === 'GET' || method === 'HEAD') return false;
-  if (!url.pathname.startsWith('/api/')) return false;
-  if (url.pathname === '/api/login_plain') return false;
-  return true;
+
+  return (
+    url.pathname === '/api/login' ||
+    url.pathname === '/api/echo'
+  );
 }
 
 async function postMetric(eventName, fields = {}) {
@@ -132,6 +139,140 @@ async function generateReqSigningKeypair() {
   };
 }
 
+async function fetchVerifiedHostJweJwk() {
+  if (!SIG_VERIFY_KEY) {
+    throw new Error('verification key not installed yet');
+  }
+
+  const targetUri = '/key-exchange';
+  const upstreamUrl = APP_ORIGIN + targetUri;
+
+  const r = await fetch(upstreamUrl, {
+    method: 'GET',
+    mode: 'cors',
+    cache: 'no-store',
+    redirect: 'follow',
+    credentials: 'omit'
+  });
+
+  if (!r.ok) {
+    throw new Error('key-exchange failed HTTP ' + r.status);
+  }
+
+  const bodyBytes = await r.clone().arrayBuffer();
+  await verifyResponse(r, bodyBytes, 'GET', targetUri);
+
+  const jwk = JSON.parse(new TextDecoder().decode(bodyBytes));
+  if (!jwk || jwk.kty !== 'RSA' || !jwk.n || !jwk.e) {
+    throw new Error('invalid host JWE key');
+  }
+
+  HOST_JWE_JWK = jwk;
+  HOST_JWE_KID = jwk.kid || '(no-kid)';
+
+  log('verified host JWE key fetched (kid=' + HOST_JWE_KID + ')');
+
+  return jwk;
+}
+
+async function registerReqSigningKeyWithServer() {
+  const hostJwk = HOST_JWE_JWK || await fetchVerifiedHostJweJwk();
+  const result = await generateReqSigningKeypair();
+
+  log('registering request-sign public key with server (kid=' + result.kid + ')');
+
+  const rr = await fetch(APP_ORIGIN + '/req-key/register', {
+    method: 'POST',
+    mode: 'cors',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      kid: result.kid,
+      jwk: result.jwk
+    })
+  });
+
+  if (!rr.ok) {
+    throw new Error('req-key/register failed HTTP ' + rr.status);
+  }
+
+  const txt = await rr.text();
+  let j = null;
+  try { j = JSON.parse(txt); } catch {}
+
+  if (!j?.ok) {
+    throw new Error('request-sign registration not accepted');
+  }
+
+  REQ_SIGN_READY = true;
+
+  return {
+    ok: true,
+    reqSignKid: result.kid,
+    hostJweKid: hostJwk.kid || '(no-kid)',
+    hostJweJwk: hostJwk,
+    sw_req_keygen_ms: result.keygenMs,
+    sw_req_key_export_ms: result.exportMs,
+    sw_req_key_total_ms: result.totalMs,
+    sw_req_key_reused: result.reused
+  };
+}
+
+async function ensureProtectedFlowReady() {
+  if (HOST_JWE_JWK && REQ_SIGN_READY && REQ_SIGN_KID) {
+    return {
+      ok: true,
+      reqSignReady: true,
+      reqSignKid: REQ_SIGN_KID,
+      hostJweKid: HOST_JWE_KID,
+      hostJweJwk: HOST_JWE_JWK,
+      reused: true
+    };
+  }
+
+  if (PROTECTED_FLOW_BOOTSTRAP_PROMISE) {
+    return await PROTECTED_FLOW_BOOTSTRAP_PROMISE;
+  }
+
+  PROTECTED_FLOW_BOOTSTRAP_PROMISE = (async () => {
+    const started = performance.now();
+
+    if (!HOST_JWE_JWK) {
+      await fetchVerifiedHostJweJwk();
+    }
+
+    const reg = await registerReqSigningKeyWithServer();
+
+    const out = {
+      ok: true,
+      reqSignReady: true,
+      reqSignKid: reg.reqSignKid,
+      hostJweKid: reg.hostJweKid,
+      hostJweJwk: reg.hostJweJwk,
+      sw_req_keygen_ms: reg.sw_req_keygen_ms,
+      sw_req_key_export_ms: reg.sw_req_key_export_ms,
+      sw_req_key_total_ms: reg.sw_req_key_total_ms,
+      sw_req_key_reused: reg.sw_req_key_reused,
+      protected_flow_bootstrap_ms: ms3(performance.now() - started)
+    };
+
+    log(
+      'protected-flow ready',
+      'hostKid=' + out.hostJweKid,
+      'reqSignKid=' + out.reqSignKid,
+      'bootstrapMs=' + out.protected_flow_bootstrap_ms
+    );
+
+    return out;
+  })();
+
+  try {
+    return await PROTECTED_FLOW_BOOTSTRAP_PROMISE;
+  } finally {
+    PROTECTED_FLOW_BOOTSTRAP_PROMISE = null;
+  }
+}
+
 self.addEventListener('message', async event => {
   const type = event.data?.type;
 
@@ -163,54 +304,29 @@ self.addEventListener('message', async event => {
     return;
   }
 
-  if (type === 'INIT_REQ_SIGNING') {
+  if (type === 'GET_PROTECTED_FLOW_STATE') {
     try {
-      const result = await generateReqSigningKeypair();
-      log(
-        'request-sign key generated (kid=' + result.kid + ', totalMs=' + result.totalMs + ')'
-      );
+      const state = await ensureProtectedFlowReady();
 
       if (event.source?.postMessage) {
         event.source.postMessage({
-          type: 'REQ_SIGN_PUBLIC_KEY',
-          kid: result.kid,
-          jwk: result.jwk,
-          sw_req_keygen_ms: result.keygenMs,
-          sw_req_key_export_ms: result.exportMs,
-          sw_req_key_total_ms: result.totalMs,
-          sw_req_key_reused: result.reused
+          type: 'PROTECTED_FLOW_STATE',
+          ...state
         });
       }
     } catch (e) {
       const msg = e?.message || String(e);
-      log('ERROR generating request-sign key:', msg);
+      log('ERROR protected-flow bootstrap:', msg);
 
       if (event.source?.postMessage) {
-        event.source.postMessage({ type: 'REQ_SIGN_ERROR', message: msg });
+        event.source.postMessage({
+          type: 'PROTECTED_FLOW_STATE',
+          ok: false,
+          message: msg
+        });
       }
     }
     return;
-  }
-
-  if (type === 'REQ_SIGNING_REGISTERED') {
-    try {
-      if (!REQ_SIGN_KEYPAIR || !REQ_SIGN_KID) throw new Error('request-sign keypair missing');
-      if (event.data.kid !== REQ_SIGN_KID) throw new Error('registered kid mismatch');
-
-      REQ_SIGN_READY = true;
-      log('request-signing ready (kid=' + REQ_SIGN_KID + ')');
-
-      if (event.source?.postMessage) {
-        event.source.postMessage({ type: 'REQ_SIGNING_READY', kid: REQ_SIGN_KID });
-      }
-    } catch (e) {
-      const msg = e?.message || String(e);
-      log('ERROR request-signing ready:', msg);
-
-      if (event.source?.postMessage) {
-        event.source.postMessage({ type: 'REQ_SIGN_ERROR', message: msg });
-      }
-    }
   }
 });
 
@@ -451,6 +567,7 @@ self.addEventListener('fetch', event => {
 
     let reqSignMetrics = null;
     if (shouldSignRequest(url, event.request.method)) {
+      await ensureProtectedFlowReady();
       const targetUri = url.pathname + url.search;
       reqSignMetrics = await addRequestSignature(init.headers, event.request.method, targetUri, requestBodyBytes);
     }

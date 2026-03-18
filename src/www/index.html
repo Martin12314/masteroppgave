@@ -43,7 +43,6 @@
     <a href="/index.html?tamper=all">all</a>
 </p>
 
-
 <fieldset>
     <legend>Body</legend>
     <label>Name <input id="name" placeholder="alice"></label>
@@ -60,7 +59,7 @@
 </fieldset>
 
 <div class="row">
-    <button id="sendBtn">Send</button>
+    <button id="sendBtn" disabled>Send</button>
     <label class="small"><input type="checkbox" id="verbose"> verbose logs (show full JWE strings)</label>
 </div>
 
@@ -73,12 +72,9 @@
 <script type="module">
     import { CompactEncrypt, importJWK } from 'https://cdn.jsdelivr.net/npm/jose@5.3.0/+esm';
 
-    /* ===============================
-       Unified logging (SW + page)
-    ================================ */
-
     const secLog = document.getElementById('security-log');
     const verbose = document.getElementById('verbose');
+    const sendBtn = document.getElementById('sendBtn');
 
     function appendLog(line) {
       secLog.textContent += line + '\n';
@@ -103,22 +99,50 @@
       pageLog('ERROR', e.message);
     });
 
-    /* ===============================
-       Key exchange status badge
-    ================================ */
-
     const kxStatus = document.getElementById('kxStatus');
     function badge(ok, text) {
       kxStatus.textContent = text;
       kxStatus.className = 'status ' + (ok ? 'ok' : 'fail');
     }
 
-    /* ===============================
-       App logic
-    ================================ */
-
     let jweKey = null;
     let kid = null;
+    let reqSignOK = false;
+
+    async function swActive() {
+      const reg = await navigator.serviceWorker.ready;
+      return navigator.serviceWorker.controller || reg.active || reg.waiting || reg.installing;
+    }
+
+    function waitForSWMessage(types, timeoutMs = 6000) {
+      const wanted = new Set(Array.isArray(types) ? types : [types]);
+
+      return new Promise((resolve, reject) => {
+        const t = setTimeout(() => {
+          navigator.serviceWorker.removeEventListener('message', onMsg);
+          reject(new Error('Timed out waiting for SW message: ' + Array.from(wanted).join(',')));
+        }, timeoutMs);
+
+        function onMsg(ev) {
+          const type = ev?.data?.type;
+          if (!wanted.has(type)) return;
+          clearTimeout(t);
+          navigator.serviceWorker.removeEventListener('message', onMsg);
+          resolve(ev.data);
+        }
+
+        navigator.serviceWorker.addEventListener('message', onMsg);
+      });
+    }
+
+    async function getReqSignStatus() {
+      const active = await swActive();
+      if (!active) throw new Error('No active Service Worker instance');
+
+      const p = waitForSWMessage('REQ_SIGN_STATUS', 4000);
+      active.postMessage({ type: 'GET_REQ_SIGN_STATUS' });
+      return await p;
+    }
 
     async function initKey() {
       pageLog('Fetching JWE public key from /key-exchange (expect SW to verify)');
@@ -127,8 +151,6 @@
       pageLog('tamper=', tamper || 'none', 'fetch=', '/key-exchange' + q);
 
       const r = await fetch('/key-exchange' + q, { cache:'no-store' });
-
-
 
       pageLog('key-exchange HTTP', r.status, r.statusText);
       if (!r.ok) {
@@ -145,7 +167,18 @@
         'RSA-OAEP-256'
       );
 
+      const rs = await getReqSignStatus();
+      reqSignOK = !!rs.ready;
+      pageLog('Request-sign status from SW: ready=', String(reqSignOK), 'kid=', rs.kid || '(none)');
+
+      if (!reqSignOK) {
+        badge(false, 'Request-signing not ready in Service Worker');
+        sendBtn.disabled = true;
+        return;
+      }
+
       badge(true, 'Key exchange OK (JWE key imported)');
+      sendBtn.disabled = false;
       pageLog('JWE public key imported');
     }
 
@@ -162,7 +195,6 @@
       return s.slice(0, 40) + ' … ' + s.slice(-28) + ` (len=${s.length})`;
     }
 
-    // Init immediately
     initKey().catch(err => {
       badge(false, 'Key exchange error: ' + err.message);
       pageLog('Key exchange error:', err.message);
@@ -172,7 +204,12 @@
     document.getElementById('sendBtn').addEventListener('click', async () => {
       if (!jweKey) {
         pageLog('Cannot send: JWE key not ready yet');
-        alert('Key not ready yet (key-exchange failed or still loading). Check log.');
+        alert('Key not ready yet. Check log.');
+        return;
+      }
+      if (!reqSignOK) {
+        pageLog('Cannot send: request-signing not ready yet');
+        alert('Request-signing not ready yet. Check log.');
         return;
       }
 
@@ -206,7 +243,6 @@
         else headers['X-Custom'] = xhdrVal;
       }
 
-      // Log what will be sent (safe-ish: JWE shortened unless verbose)
       pageLog('Request body preview:',
         `name=${encName ? 'JWE ' + maybeShort(body.name) : JSON.stringify(body.name)}`,
         `age=${body.age}`,
