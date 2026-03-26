@@ -44,7 +44,8 @@
 
 <script>
     const APP_ORIGIN = 'https://app.masteroppgave2026.no';
-    const METRICS_URL = APP_ORIGIN + '/metrics';
+    const METRICS_URL = APP_ORIGIN + '/metrics?sw-bypass=1';
+    const BASELINE_LOGIN_URL = '/api/login_plain?sw-bypass=1';
     const out = document.getElementById('log');
 
     function log(...args){
@@ -93,7 +94,7 @@
       const bodyStr = JSON.stringify(bodyObj);
 
       const t0 = performance.now();
-      const r = await fetch('/api/login_plain', {
+      const r = await fetch(BASELINE_LOGIN_URL, {
         method:'POST',
         headers:{
           'Content-Type':'application/json',
@@ -108,7 +109,8 @@
       const txt = await r.text();
 
       await postMetric('baseline_login_request', {
-        runTag, iter,
+        runTag,
+        iter,
         pad_bytes: padN,
         http_status: r.status,
         login_fetch_ms: Number(fetchMs.toFixed(2)),
