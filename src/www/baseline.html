@@ -35,7 +35,7 @@
         <label>Extra payload (bytes)
             <input id="padBytes" type="number" min="0" step="1" value="0">
         </label>
-        <button id="benchBtn">Run 30× baseline benchmark</button>
+        <button id="benchBtn">Run 1000× baseline benchmark</button>
     </div>
 </div>
 
@@ -123,7 +123,7 @@
       return { ok: !!j?.ok, status: r.status };
     }
 
-    async function runBaselineBench(n=30){
+    async function runBaselineBench(n=1000){
       const runTag = `baseline-${Date.now()}`;
       log('Starting baseline benchmark', runTag);
 
@@ -151,7 +151,7 @@
 
     document.getElementById('benchBtn').addEventListener('click', e => {
       e.preventDefault();
-      runBaselineBench(30);
+      runBaselineBench(1000);
     });
 </script>
 </body>

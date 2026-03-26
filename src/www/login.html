@@ -1,140 +1,482 @@
-// Trusted installer: bootstraps trust using DNS TXT pinning
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Login</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <link rel="stylesheet" href="/styles.css">
+    <style>
+        .card { max-width: 860px; padding:1rem; border:1px solid #ddd; border-radius:.5rem; }
+        .row { display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; }
+        .muted { color:#555; }
+        .bad { color:#b00020; font-weight:600; }
+        .good { color:#056e00; font-weight:600; }
+        .logbox {
+          background:#0b1020;
+          color:#d0d7ff;
+          padding:1rem;
+          border-radius:.5rem;
+          max-height:340px;
+          overflow:auto;
+          font-size:.85rem;
+          white-space:pre-wrap;
+          word-break:break-word;
+        }
+        input[type="number"] { width: 120px; }
+        iframe.benchframe {
+          width: 1px;
+          height: 1px;
+          border: 0;
+          position: absolute;
+          left: -9999px;
+          top: -9999px;
+        }
+    </style>
+</head>
+<body>
+<h1>Login</h1>
 
-const out = document.getElementById('log');
+<p style="margin:.5rem 0 1rem 0">
+    Tamper demo:
+    <a href="/login.html">normal</a> ·
+    <a href="/login.html?tamper=signature">signature</a> ·
+    <a href="/login.html?tamper=digest">digest</a> ·
+    <a href="/login.html?tamper=body">body</a> ·
+    <a href="/login.html?tamper=all">all</a>
+</p>
 
-function log(m) {
-console.log('[INSTALL]', m);
-out.textContent += '\n' + m;
-out.scrollTop = out.scrollHeight;
-}
+<div class="card">
+    <div class="row">
+        <label>Username <input id="user" value="alice" autocomplete="username"></label>
+        <label>Password <input id="pass" type="password" value="secret" autocomplete="current-password"></label>
+    </div>
 
-const APP_ORIGIN = 'https://app.masteroppgave2026.no';
+    <div class="row" style="margin-top:.5rem">
+        <label>Extra payload (bytes)
+            <input id="padBytes" type="number" min="0" step="1" value="0">
+        </label>
+        <button id="loginBtn" disabled>Sign in</button>
+        <button id="benchBtn" disabled>Run 1000× protected login</button>
+    </div>
 
-// -------------------- DNS pin lookup --------------------
+    <div class="row">
+        <button id="bigProtectedBtn" disabled>Run 1000× protected big</button>
+        <button id="bigBaselineBtn">Run 1000× baseline big</button>
+    </div>
 
-async function fetchDNSPin() {
-console.log('[INSTALL] VERSION = 2026-01-29');
-log('[INSTALL] VERSION = 2026-01-29');
+    <div class="row">
+        <label><input type="checkbox" id="allowUnsafe"> allow unsafe key (for tests)</label>
+        <label><input type="checkbox" id="verbose"> verbose logs</label>
+    </div>
 
-log('Fetching SIG-PUB pin from DNS TXT (_sigpub.app.masteroppgave2026.no)…');
+    <div class="row">
+        <span id="kxStatus" class="muted">Protected flow not initialized yet…</span>
+    </div>
+</div>
 
-const r = await fetch(
-'https://cloudflare-dns.com/dns-query?name=_sigpub.app.masteroppgave2026.no&type=TXT',
-{
-headers: { accept: 'application/dns-json' },
-cache: 'no-store'
-}
-);
+<h3>Security + app log</h3>
+<pre id="security-log" class="logbox">Waiting for Service Worker…</pre>
 
-const j = await r.json();
-const raw = j.Answer?.[0]?.data?.replace(/"/g, '');
+<iframe id="benchFrame" class="benchframe"></iframe>
 
-if (!raw) throw new Error('DNS pin missing');
+<script type="module">
+    import { CompactEncrypt, importJWK } from 'https://cdn.jsdelivr.net/npm/jose@5.3.0/+esm';
 
-const parts = Object.fromEntries(
-raw.split(';').map(p => p.split('=', 2))
-);
+    const APP_ORIGIN = 'https://app.masteroppgave2026.no';
+    const METRICS_URL = APP_ORIGIN + '/metrics';
 
-if (parts.v !== '1') throw new Error('Unsupported DNS pin version');
-if (!parts.kid || !parts.sha256) throw new Error('DNS pin missing kid or sha256');
+    const secLog = document.getElementById('security-log');
+    const kxStatus = document.getElementById('kxStatus');
+    const loginBtn = document.getElementById('loginBtn');
+    const benchBtn = document.getElementById('benchBtn');
+    const bigProtectedBtn = document.getElementById('bigProtectedBtn');
+    const bigBaselineBtn = document.getElementById('bigBaselineBtn');
+    const allowUnsafe = document.getElementById('allowUnsafe');
+    const verbose = document.getElementById('verbose');
+    const benchFrame = document.getElementById('benchFrame');
 
-log(`DNS pin loaded (kid=${parts.kid})`);
-return { kid: parts.kid, sha256: parts.sha256 };
-}
+    function nowTs(){ return new Date().toISOString(); }
+    function utf8Bytes(str){ return new TextEncoder().encode(str).length; }
+    function ms3(v){ return Number(Number(v).toFixed(3)); }
 
-// -------------------- Hash helper --------------------
+    function appendLog(line){
+      secLog.textContent += line + '\n';
+      secLog.scrollTop = secLog.scrollHeight;
+    }
 
-async function hashJWK(jwk) {
-const canonical = JSON.stringify({ kty: jwk.kty, n: jwk.n, e: jwk.e });
-const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
-return btoa(String.fromCharCode(...new Uint8Array(buf)));
-}
+    function pageLog(...args){
+      appendLog(`[${nowTs()}] [PAGE] ${args.join(' ')}`);
+    }
 
-function normalizeB64(s) {
-return s.replace(/=+$/, '');
-}
+    async function postMetric(eventName, fields = {}) {
+      const payload = {
+        event: eventName,
+        at: new Date().toISOString(),
+        page_url: location.href,
+        origin: location.origin,
+        source: 'page',
+        ...fields
+      };
 
-// Wait until SW confirms it imported the key
-function waitForSWKeyAck(expectedKid, timeoutMs = 4000) {
-return new Promise((resolve, reject) => {
-const t = setTimeout(() => {
-navigator.serviceWorker.removeEventListener('message', onMsg);
-reject(new Error('Timed out waiting for SW key install ack'));
-}, timeoutMs);
+      try {
+        await fetch(METRICS_URL, {
+          method:'POST',
+          mode:'no-cors',
+          cache:'no-store',
+          headers:{ 'Content-Type':'application/json' },
+          body: JSON.stringify(payload)
+        });
+      } catch (e) {
+        console.error('[PAGE] metric send failed', e);
+      }
+    }
 
-function onMsg(ev) {
-if (ev?.data?.type === 'SIG_KEY_INSTALLED' && ev.data.kid === expectedKid) {
-clearTimeout(t);
-navigator.serviceWorker.removeEventListener('message', onMsg);
-resolve(true);
-}
-if (ev?.data?.type === 'SIG_KEY_ERROR') {
-clearTimeout(t);
-navigator.serviceWorker.removeEventListener('message', onMsg);
-reject(new Error('SW failed to install key: ' + (ev.data.message || 'unknown')));
-}
-}
+    navigator.serviceWorker?.addEventListener('message', e => {
+      if (e.data?.type === 'SW_LOG') {
+        appendLog(`[${e.data.ts}] [SW] ${e.data.message}`);
+      }
+    });
 
-navigator.serviceWorker.addEventListener('message', onMsg);
-});
-}
+    function setKx(ok, msg){
+      kxStatus.innerHTML = ok
+        ? `<span class="good">${msg}</span>`
+        : `<span class="bad">${msg}</span>`;
+    }
 
-// -------------------- Main installer flow --------------------
+    function maybeShort(s) {
+      if (verbose.checked) return s;
+      if (!s) return s;
+      if (s.length <= 90) return s;
+      return s.slice(0, 45) + ' … ' + s.slice(-32) + ` (len=${s.length})`;
+    }
 
-async function main() {
-log('Installer started');
+    function makePad(n) {
+      n = Number(n) | 0;
+      if (n <= 0) return '';
+      return 'x'.repeat(n);
+    }
 
-// 1) DNS pin
-const pinned = await fetchDNSPin();
+    let jweKey = null;
+    let kid = null;
+    let kxOK = false;
+    let reqSignOK = false;
 
-// 2) Fetch signature public key from app origin (requires strict CORS on app.*)
-log('Fetching /sig-pub from app origin…');
-const r = await fetch(APP_ORIGIN + '/sig-pub', {
-cache: 'no-store',
-mode: 'cors'
-});
+    function refreshButtons() {
+      const protectedEnabled = ((kxOK && reqSignOK) || allowUnsafe.checked);
+      loginBtn.disabled = !protectedEnabled;
+      benchBtn.disabled = !protectedEnabled;
+      bigProtectedBtn.disabled = !protectedEnabled;
+      bigBaselineBtn.disabled = false;
+    }
 
-if (!r.ok) throw new Error('Failed to fetch /sig-pub (HTTP ' + r.status + ')');
+    allowUnsafe.addEventListener('change', refreshButtons);
 
-const jwk = await r.json();
-log(`Got SIG-PUB (kid=${jwk.kid})`);
+    async function swActive() {
+      const reg = await navigator.serviceWorker.ready;
+      return navigator.serviceWorker.controller || reg.active || reg.waiting || reg.installing;
+    }
 
-const now = Math.floor(Date.now() / 1000);
-if (jwk.created > now + 60) throw new Error('SIG-PUB created in the future');
-if (jwk.expires < now) throw new Error('SIG-PUB expired');
-if (jwk.kid !== pinned.kid) throw new Error(`KID mismatch: DNS=${pinned.kid}, SIG-PUB=${jwk.kid}`);
+    function waitForSWMessage(types, timeoutMs = 6000) {
+      const wanted = new Set(Array.isArray(types) ? types : [types]);
 
-// 3) Verify key material
-const localHash = await hashJWK(jwk);
-if (normalizeB64(localHash) !== normalizeB64(pinned.sha256)) {
-throw new Error('MITM detected: SIG-PUB hash mismatch');
-}
-log('SIG-PUB verified against DNS pin');
+      return new Promise((resolve, reject) => {
+        const t = setTimeout(() => {
+          navigator.serviceWorker.removeEventListener('message', onMsg);
+          reject(new Error('Timed out waiting for SW message: ' + Array.from(wanted).join(',')));
+        }, timeoutMs);
 
-// 4) Register Service Worker
-if (!('serviceWorker' in navigator)) throw new Error('ServiceWorker not supported');
+        function onMsg(ev) {
+          const type = ev?.data?.type;
+          if (!wanted.has(type)) return;
+          clearTimeout(t);
+          navigator.serviceWorker.removeEventListener('message', onMsg);
+          resolve(ev.data);
+        }
 
-log('Registering Service Worker /sw.js …');
-const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
-await navigator.serviceWorker.ready;
-log('Service Worker ready');
+        navigator.serviceWorker.addEventListener('message', onMsg);
+      });
+    }
 
-const active = reg.active || reg.waiting || reg.installing;
-if (!active) throw new Error('No active Service Worker instance');
+    async function initKey(){
+      try {
+        const active = await swActive();
+        if (!active) throw new Error('No active Service Worker');
 
-// 5) Deliver verified key to SW + wait for ack
-log('Sending verified key to Service Worker');
-const ackPromise = waitForSWKeyAck(jwk.kid, 4000);
-active.postMessage({ type: 'SET_SIG_KEY', jwk });
-await ackPromise;
-log('Service Worker confirmed key installed');
+        pageLog('Requesting protected-flow state from Service Worker');
+        const msgPromise = waitForSWMessage('PROTECTED_FLOW_STATE', 10000);
+        active.postMessage({ type: 'GET_PROTECTED_FLOW_STATE' });
+        const msg = await msgPromise;
 
-// 6) Enter protected application (same apex URL; SW will fetch verified bytes from app.*)
-log('Redirecting to /login.html …');
-location.replace('/login.html');
-}
+        if (!msg?.ok) {
+          throw new Error(msg?.message || 'SW protected-flow init failed');
+        }
 
-main().catch(err => {
-log('FATAL: ' + (err?.message || err));
-console.error(err);
-});
+        const jwk = msg.hostJweJwk;
+        if (!jwk?.n || !jwk?.e) {
+          throw new Error('Missing host JWE key from Service Worker');
+        }
+
+        kid = jwk.kid || '(no-kid)';
+        pageLog('Received host JWE key from SW kid=', kid);
+
+        jweKey = await importJWK(
+          { kty:'RSA', n:jwk.n, e:jwk.e, alg:'RSA-OAEP-256' },
+          'RSA-OAEP-256'
+        );
+
+        kxOK = true;
+        reqSignOK = !!msg.reqSignReady;
+
+        setKx(true, 'Protected flow OK (JWE key + SW request signing ready)');
+        pageLog('Host JWE public key imported');
+        pageLog('SW request-sign ready kid=', msg.reqSignKid || '(none)');
+
+        await postMetric('protected_flow_bootstrap', {
+          host_jwe_kid: kid,
+          req_sign_kid: msg.reqSignKid || '',
+          req_sign_ready: !!msg.reqSignReady,
+          sw_req_keygen_ms: ms3(msg.sw_req_keygen_ms || 0),
+          sw_req_key_export_ms: ms3(msg.sw_req_key_export_ms || 0),
+          sw_req_key_total_ms: ms3(msg.sw_req_key_total_ms || 0),
+          protected_flow_bootstrap_ms: ms3(msg.protected_flow_bootstrap_ms || 0)
+        });
+      } catch (e) {
+        kxOK = false;
+        reqSignOK = false;
+        setKx(false, 'Protected flow init failed: ' + (e.message || e));
+        pageLog('Init failed:', e.message || String(e));
+        console.error(e);
+      } finally {
+        refreshButtons();
+      }
+    }
+
+    async function enc(plaintext){
+      const ce = new CompactEncrypt(new TextEncoder().encode(plaintext));
+      ce.setProtectedHeader({ alg:'RSA-OAEP-256', enc:'A256GCM', kid });
+      return await ce.encrypt(jweKey);
+    }
+
+    async function doProtectedOnce({ runTag = '', iter = '' } = {}){
+      if (!(kxOK && reqSignOK) && !allowUnsafe.checked) {
+        throw new Error('Protected flow not ready. Check logs.');
+      }
+      if (!jweKey) {
+        throw new Error('JWE key missing. Check logs.');
+      }
+
+      const u = document.getElementById('user').value || '';
+      const p = document.getElementById('pass').value || '';
+      const padN = Number(document.getElementById('padBytes').value || 0) | 0;
+      const pad = makePad(padN);
+
+      pageLog('Encrypting credentials…');
+
+      const encStart = performance.now();
+      const uEnc = await enc(u);
+      const pEnc = await enc(p);
+      const jweMs = performance.now() - encStart;
+
+      pageLog('Encrypted username:', maybeShort(uEnc));
+      pageLog('Encrypted password:', maybeShort(pEnc));
+
+      const bodyObj = {
+        username: 'JWE: ' + uEnc,
+        password: 'JWE: ' + pEnc,
+        pad
+      };
+      const bodyStr = JSON.stringify(bodyObj);
+
+      pageLog('Sending POST /api/login');
+      const fetchStart = performance.now();
+
+      const r = await fetch('/api/login', {
+        method:'POST',
+        headers:{
+          'Content-Type':'application/json',
+          'X-Run-Tag': runTag,
+          'X-Req-Seq': String(iter),
+          'X-Bench-Kind': 'protected-login'
+        },
+        body: bodyStr
+      });
+
+      const fetchMs = performance.now() - fetchStart;
+      pageLog('Login HTTP', r.status, r.statusText, `(${Math.round(fetchMs)}ms)`);
+
+      const txt = await r.text();
+      pageLog('Login response body:', txt);
+
+      let j = null;
+      try { j = JSON.parse(txt); } catch {}
+
+      await postMetric('protected_login_request', {
+        runTag,
+        iter: Number(iter),
+        pad_bytes: padN,
+        http_status: r.status,
+        ok: !!j?.ok,
+        jwe_encrypt_ms: ms3(jweMs),
+        login_fetch_ms: ms3(fetchMs),
+        login_req_body_bytes: utf8Bytes(bodyStr),
+        login_resp_body_bytes: utf8Bytes(txt),
+        host_req_header_bytes: Number(r.headers.get('X-Metric-Req-Header-Bytes') || 0),
+        host_req_body_bytes: Number(r.headers.get('X-Metric-Req-Body-Bytes') || 0),
+        host_req_sign_header_bytes: Number(r.headers.get('X-Metric-Req-Sign-Header-Bytes') || 0),
+        host_decrypt_ms: Number(r.headers.get('X-Metric-Decrypt-Ms') || 0),
+        host_req_verify_ms: Number(r.headers.get('X-Metric-Req-Verify-Ms') || 0)
+      });
+
+      return { ok: !!j?.ok, status: r.status };
+    }
+
+    async function doLogin(){
+      const res = await doProtectedOnce({ runTag:'interactive-' + Date.now(), iter:1 });
+      if (res.ok) {
+        pageLog('Login OK → redirect /index.html');
+        location.href = '/index.html';
+      } else {
+        pageLog('Login failed (ok=false)');
+        alert('Login failed. See log.');
+      }
+    }
+
+    async function runProtectedBench(n = 1000){
+      const runTag = `protected-${Date.now()}`;
+      pageLog('Starting protected login benchmark:', runTag);
+
+      await postMetric('protected_bench_start', { runTag, n });
+
+      let okCount = 0;
+
+      for (let i = 1; i <= n; i++) {
+        try {
+          const res = await doProtectedOnce({ runTag, iter:i });
+          if (res.ok) okCount++;
+        } catch (e) {
+          pageLog('Protected login iteration failed:', i, e.message || String(e));
+          await postMetric('protected_iter_error', {
+            runTag,
+            iter:i,
+            err: e?.message || String(e)
+          });
+        }
+        await new Promise(r => setTimeout(r, 50));
+      }
+
+      await postMetric('protected_bench_done', { runTag, n, okCount });
+      pageLog('Protected login benchmark done:', runTag, 'okCount=', okCount);
+    }
+
+    function loadBigIteration({ mode, runTag, iter }) {
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          window.removeEventListener('message', onMessage);
+          reject(new Error(`Big benchmark iteration ${iter} timed out`));
+        }, 30000);
+
+        function onMessage(ev) {
+          if (ev.origin !== location.origin) return;
+          if (ev.data?.type !== 'BIG_BENCH_DONE') return;
+          if (ev.data?.runTag !== runTag) return;
+          if (Number(ev.data?.iter) !== Number(iter)) return;
+          if (ev.data?.mode !== mode) return;
+
+          clearTimeout(timeout);
+          window.removeEventListener('message', onMessage);
+
+          if (ev.data?.error) reject(new Error(ev.data.error));
+          else resolve(true);
+        }
+
+        window.addEventListener('message', onMessage);
+
+        const p = new URLSearchParams();
+        p.set('mode', mode);
+        p.set('runTag', runTag);
+        p.set('iter', String(iter));
+        if (mode === 'baseline') p.set('sw-bypass', '1');
+
+        benchFrame.src = '/big.html?' + p.toString();
+      });
+    }
+
+    async function runBigBench(mode, n = 1000) {
+      const runTag = `${mode}-big-${Date.now()}`;
+      pageLog(`Starting ${mode} big benchmark:`, runTag);
+
+      await postMetric('big_bench_start', {
+        runTag,
+        n,
+        mode,
+        bench_kind: mode === 'baseline' ? 'big-baseline' : 'big-protected'
+      });
+
+      let okCount = 0;
+
+      for (let i = 1; i <= n; i++) {
+        try {
+          await loadBigIteration({ mode, runTag, iter: i });
+          okCount++;
+          pageLog(`${mode} big iteration done:`, i);
+        } catch (e) {
+          pageLog(`${mode} big iteration failed:`, i, e.message || String(e));
+          await postMetric('big_iter_error', {
+            runTag,
+            iter:i,
+            mode,
+            err: e?.message || String(e)
+          });
+        }
+        await new Promise(r => setTimeout(r, 100));
+      }
+
+      benchFrame.src = 'about:blank';
+
+      await postMetric('big_bench_done', {
+        runTag,
+        n,
+        okCount,
+        mode,
+        bench_kind: mode === 'baseline' ? 'big-baseline' : 'big-protected'
+      });
+
+      pageLog(`${mode} big benchmark done:`, runTag, 'okCount=', okCount);
+    }
+
+    initKey();
+
+    loginBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      doLogin().catch(err => {
+        pageLog('Login ERROR:', err.message || String(err));
+        alert('Login error: ' + (err.message || err));
+      });
+    });
+
+    benchBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      runProtectedBench(1000).catch(err => {
+        pageLog('Protected benchmark ERROR:', err.message || String(err));
+        alert('Benchmark error: ' + (err.message || err));
+      });
+    });
+
+    bigProtectedBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      runBigBench('protected', 1000).catch(err => {
+        pageLog('Protected big benchmark ERROR:', err.message || String(err));
+        alert('Protected big benchmark error: ' + (err.message || err));
+      });
+    });
+
+    bigBaselineBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      runBigBench('baseline', 1000).catch(err => {
+        pageLog('Baseline big benchmark ERROR:', err.message || String(err));
+        alert('Baseline big benchmark error: ' + (err.message || err));
+      });
+    });
+</script>
+</body>
+</html>
