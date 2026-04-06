@@ -157,8 +157,6 @@ public class Server {
 
     private static void handleReqKeyRegister(HttpExchange ex) {
         try {
-            ex.setAttribute("disableSigning", Boolean.TRUE);
-
             if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
                 ex.setAttribute("handlerResult", HandlerResult.text(405, "Method Not Allowed"));
                 return;
@@ -168,29 +166,13 @@ public class Server {
             Map<String, Object> req = tryParseJsonMap(body);
 
             String kid = stringValue(req.get("kid"));
+            String suppliedThumbprint = stringValue(req.get("jwkThumbprint"));
+            String proofB64 = stringValue(req.get("proof"));
             Object jwkObj = req.get("jwk");
 
-            // Backward-compatible path: still accept encrypted registration if sent
-            if ((kid == null || kid.isBlank() || jwkObj == null) && req.get("jwe") != null) {
-                String compactJwe = stringValue(req.get("jwe"));
-                if (compactJwe == null || compactJwe.isBlank()) {
-                    ex.setAttribute("handlerResult", HandlerResult.text(400, "Missing jwe"));
-                    return;
-                }
-
-                String payload = jweDecrypt(compactJwe);
-                if (payload == null) {
-                    ex.setAttribute("handlerResult", HandlerResult.text(400, "JWE decrypt failed"));
-                    return;
-                }
-
-                Map<String, Object> reg = tryParseJsonMap(payload);
-                kid = stringValue(reg.get("kid"));
-                jwkObj = reg.get("jwk");
-            }
-
-            if (kid == null || kid.isBlank() || jwkObj == null) {
-                ex.setAttribute("handlerResult", HandlerResult.text(400, "Missing kid/jwk"));
+            if (kid == null || kid.isBlank() || suppliedThumbprint == null || suppliedThumbprint.isBlank() ||
+                    proofB64 == null || proofB64.isBlank() || jwkObj == null) {
+                ex.setAttribute("handlerResult", HandlerResult.text(400, "Missing kid/jwk/jwkThumbprint/proof"));
                 return;
             }
 
@@ -198,9 +180,28 @@ public class Server {
             RsaJsonWebKey clientJwk = (RsaJsonWebKey) JsonWebKey.Factory.newJwk(jwkJson);
             RSAPublicKey clientPub = (RSAPublicKey) clientJwk.getPublicKey();
 
+            String computedThumbprint = computeReqSignJwkThumbprint(clientJwk);
+            if (!computedThumbprint.equals(suppliedThumbprint)) {
+                ex.setAttribute("handlerResult", HandlerResult.text(400, "JWK thumbprint mismatch"));
+                return;
+            }
+
+            String proofBase = buildReqKeyRegistrationProofBase(kid, computedThumbprint);
+            if (!verifyReqKeyRegistrationProof(clientPub, proofBase, proofB64)) {
+                ex.setAttribute("handlerResult", HandlerResult.text(401, "Bad registration proof"));
+                return;
+            }
+
             CLIENT_REQ_PUBS.put(kid, clientPub);
 
-            ex.setAttribute("handlerResult", HandlerResult.json("{\"ok\":true,\"kid\":\"" + json(kid) + "\"}"));
+            String resp =
+                    "{"
+                            + "\"ok\":true,"
+                            + "\"acceptedKid\":\"" + json(kid) + "\","
+                            + "\"acceptedThumbprint\":\"" + json(computedThumbprint) + "\""
+                            + "}";
+
+            ex.setAttribute("handlerResult", HandlerResult.json(resp));
         } catch (Exception e) {
             ex.setAttribute("handlerResult", HandlerResult.error(e.toString()));
         }
@@ -665,6 +666,32 @@ public class Server {
     private static String b64urlUnsigned(byte[] in) {
         if (in.length > 1 && in[0] == 0) in = Arrays.copyOfRange(in, 1, in.length);
         return Base64.getUrlEncoder().withoutPadding().encodeToString(in);
+    }
+
+    private static String buildReqKeyRegistrationProofBase(String kid, String thumbprint) {
+        return "\"kid\": \"" + kid + "\"\n" +
+                "\"thumbprint\": \"" + thumbprint + "\"";
+    }
+
+    private static String computeReqSignJwkThumbprint(RsaJsonWebKey jwk) throws Exception {
+        RSAPublicKey pub = (RSAPublicKey) jwk.getPublicKey();
+        String n = b64urlUnsigned(pub.getModulus().toByteArray());
+        String e = b64urlUnsigned(pub.getPublicExponent().toByteArray());
+        String canonical = "{\"e\":\"" + e + "\",\"kty\":\"RSA\",\"n\":\"" + n + "\"}";
+        byte[] digest = MessageDigest.getInstance("SHA-256").digest(canonical.getBytes(StandardCharsets.UTF_8));
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
+    }
+
+    private static boolean verifyReqKeyRegistrationProof(RSAPublicKey pub, String proofBase, String proofB64) {
+        try {
+            Signature s = Signature.getInstance("RSASSA-PSS");
+            s.setParameter(new PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1));
+            s.initVerify(pub);
+            s.update(proofBase.getBytes(StandardCharsets.UTF_8));
+            return s.verify(Base64.getDecoder().decode(proofB64));
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private static String jsonField(String json, String key) {
